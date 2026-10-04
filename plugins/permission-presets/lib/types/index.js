@@ -1,16 +1,3 @@
-/**
- * User-facing permission presets over the independent sandbox-mode and
- * approval-policy knobs. A switch records the selected preset, then writes
- * changed knobs through their canonical setters. Execution, prompt narration,
- * and replay keep reading their knob folds. The preset event preserves user
- * intent when two presets share a bundle. The Auto review integration may
- * publish one fixed, current-session-only preset with a synchronous admission
- * check; settings defaults remain limited to the configured table. The read
- * side exposes a process catalog plus the current-value-only `permissions`
- * Session projection; the write side ships as the `/permission` command.
- *
- * @module dsh-permission-presets
- */
 var __runInitializers = (this && this.__runInitializers) || function (thisArg, initializers, value) {
     var useValue = arguments.length > 2;
     for (var i = 0; i < initializers.length; i++) {
@@ -58,13 +45,15 @@ import { APPROVAL_POLICIES, setApprovalPolicy } from '@deepseek-ai/dsh-user-appr
 export const CUSTOM_PRESET = 'custom';
 /** Canonical identity of the experimental per-call review preset. */
 export const AUTO_PRESET = 'auto';
-/** Fixed execution bundle for the live Auto integration. */
+/**
+ * Fixed execution bundle for the live Auto integration. `ask` routes reviewer
+ * denials to the user; a stored Auto identity also matches `never`, which a
+ * delegated child pins so its reviewer denials stay final.
+ */
 const AUTO_PRESET_SPEC = {
     sandbox: 'danger-full-access',
-    approval: 'never',
+    approval: 'ask',
 };
-/** Settings namespace carrying the default for future sessions. */
-export const PERMISSION_SETTINGS_NAMESPACE = 'permission';
 const permissionStateSchema = zod.object({
     preset: zod.string().nullable(),
     sandbox: zod.union([
@@ -132,16 +121,16 @@ let PermissionPresetService = (() => {
                     name: 'danger-full-access', description: 'Full file access without approval prompts.',
                 },
             }),
-            defaultPreset: z.string(),
+            defaultPreset: z.string().volatile(),
         });
         static inject = ['shell', 'approval', 'sessions', 'sessionProjections'];
         presets = __runInitializers(this, _instanceExtraInitializers);
         autoAdmit;
         defaultSettings;
-        /** The preset a fresh session falls back to when its stored default has no live definition. */
         compositionDefault;
         constructor(ctx, config) {
             super(ctx, 'permissionPresets');
+            ctx.inject(['settings'], (child) => { child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)); });
             // The schema defaulted the table — the cast records that runtime fact.
             this.presets = config.presets;
             if (CUSTOM_PRESET in this.presets) {
@@ -154,38 +143,19 @@ let PermissionPresetService = (() => {
                 throw new Error('permission: the mounted bash executor does not confine (no sandboxMode) — presets bundle a sandbox mode, so composing this plugin over an unconfined executor is a misconfiguration');
             }
             const inferredDefault = this.derive(EMPTY_KNOBS);
-            const defaultPreset = config.defaultPreset ?? inferredDefault;
+            const defaultPreset = config.defaultPreset.get() ?? inferredDefault;
             if (defaultPreset === CUSTOM_PRESET) {
                 throw new Error('permission: composed sandbox and approval defaults match no preset; configure defaultPreset explicitly');
             }
-            this.resolve(defaultPreset);
-            this.compositionDefault = defaultPreset;
-            const baseSettings = { defaultPreset };
-            this.defaultSettings = () => baseSettings;
-            const presetChoices = [
-                ...Object.keys(this.presets).map((name) => {
-                    const choice = z.const(name);
-                    const label = this.presets[name]?.name;
-                    return label === undefined ? choice : choice.description(label);
-                }),
-                // Auto is a fixed contribution rather than a table entry, so its stored
-                // default is accepted here and resolved against the live registration
-                // when a session is created.
-                z.const(AUTO_PRESET).description('Auto review (requires its integration)'),
-            ];
-            const settingsSchema = z.object({
-                defaultPreset: z.union(presetChoices).required(),
-            });
-            ctx.inject(['settings'], (settingsCtx) => {
-                settingsCtx.settings.installSection(ctx, PERMISSION_SETTINGS_NAMESPACE, settingsSchema, baseSettings, {
-                    setSource: (current) => {
-                        this.defaultSettings = current;
-                    },
-                    // The source thunk reads the latest scope snapshot at session creation;
-                    // no process-level registration needs replacement on change.
-                    onChange: () => { },
-                });
-            });
+            this.compositionDefault = inferredDefault;
+            if (defaultPreset !== AUTO_PRESET)
+                this.resolve(defaultPreset);
+            this.defaultSettings = () => {
+                const defaultPreset = config.defaultPreset.get() ?? inferredDefault;
+                if (defaultPreset !== AUTO_PRESET && !Object.hasOwn(this.presets, defaultPreset))
+                    throw new Error(`permission: unknown default preset "${defaultPreset}"`);
+                return { defaultPreset };
+            };
             const selectionSchema = zod.object({
                 currentValue: zod.string().min(1),
             });
@@ -242,7 +212,11 @@ let PermissionPresetService = (() => {
          * @returns every currently selectable preset in contribution order.
          */
         catalog() {
-            return { options: this.names.map(name => this.optionOf(name)) };
+            return {
+                options: this.names.map(name => this.optionOf(name)),
+                defaultOptions: Object.keys(this.presets).map(name => this.optionOf(name)),
+                defaultPreset: this.defaultSettings().defaultPreset,
+            };
         }
         /**
          * Publish the fixed current-session Auto preset for the calling
@@ -278,7 +252,8 @@ let PermissionPresetService = (() => {
         }
         /**
          * Resolve the preset matching the effective knob values. A still-matching
-         * last selection wins shared-bundle ties; otherwise the first configured
+         * last selection wins shared-bundle ties, and a still-selected Auto also
+         * matches the `never` approval policy; otherwise the first configured
          * match wins. Returns
          * {@link CUSTOM_PRESET} when no available preset matches.
          * @param session - the session whose knob state is read.
@@ -296,6 +271,8 @@ let PermissionPresetService = (() => {
                 const spec = this.specOf(state.preset);
                 if (spec !== undefined && matches(spec))
                     return state.preset;
+                if (state.preset === AUTO_PRESET && spec?.sandbox === sandbox && approval === 'never')
+                    return AUTO_PRESET;
             }
             for (const [name, spec] of Object.entries(this.presets)) {
                 if (matches(spec))
@@ -377,12 +354,9 @@ let PermissionPresetService = (() => {
             }
             if (preset === null && sandbox === null && approval === null && !seeded) {
                 const stored = this.defaultPreset;
-                // A stored Auto default needs its live integration; without one the
-                // composition default applies rather than failing session creation.
                 const name = this.specOf(stored) === undefined ? this.compositionDefault : stored;
-                if (name !== stored) {
+                if (name !== stored)
                     this.ctx.logger.warn(`permission: stored default "${stored}" has no live definition; using "${name}"`);
-                }
                 if (name === AUTO_PRESET)
                     this.autoAdmit?.();
                 const spec = this.resolve(name);

@@ -1,13 +1,13 @@
 {
   "name": "@omh/models",
-  "version": "0.1.0",
-  "description": "Model discovery, searchable selection, persistent permission defaults, and confined GPU access",
+  "version": "0.2.0",
+  "description": "Model backend setup, automatic gateway catalogs, searchable selection, permission defaults, and confined GPU access",
   "type": "module",
   "license": "MIT",
   "private": true,
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": "0.1.6-alpha.1"
+    "dsh": "0.2.1-alpha.1"
   },
   "dsh": {
     "bundle": {
@@ -15,11 +15,15 @@
     }
   },
   "scripts": {
-    "test": "node scripts/check.mjs && node --test scripts/install.test.mjs plugins/model-sync/tests/*.test.js",
+    "test": "node scripts/check.mjs && node --test scripts/install.test.mjs scripts/backend.test.mjs plugins/model-sync/tests/*.test.js",
+    "setup:backends": "node scripts/backend-setup.mjs",
+    "doctor:backends": "node scripts/backend-doctor.mjs",
     "install:profile": "node scripts/install.mjs",
     "check:bundle": "node scripts/check.mjs",
     "test:installer": "node --test scripts/install.test.mjs",
-    "build:client": "node scripts/build-client.mjs"
+    "build:client": "node scripts/build-client.mjs",
+    "test:companion": "npm --prefix companions/opencodex test",
+    "test:companion-runtime": "npm --prefix companions/opencodex run test:bun"
   },
   "files": [
     "plugins",
@@ -30,7 +34,8 @@
     "LICENSE",
     "NOTICE.md",
     "UPSTREAM.json",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
   ],
   "repository": {
     "type": "git",
@@ -46,7 +51,8 @@
       "OMH-41",
       "OMH-42",
       "OMH-43",
-      "OMH-44"
+      "OMH-44",
+      "OMH-55"
     ]
   }
 }

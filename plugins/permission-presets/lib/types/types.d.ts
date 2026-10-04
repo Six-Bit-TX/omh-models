@@ -24,6 +24,10 @@ export interface PresetOption {
 export interface PermissionCatalog {
     /** Every currently selectable preset, in contribution order. */
     options: PresetOption[];
+    /** Configured presets eligible as defaults for future sessions. */
+    defaultOptions: PresetOption[];
+    /** Effective default when the Config field is omitted. */
+    defaultPreset: string;
 }
 /** Whole `permissions` Session projection: current durable selection only. */
 export interface PermissionSelection {
@@ -52,3 +56,4 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
         permissions: PermissionSelection;
     }
 }
+//# sourceMappingURL=types.d.ts.map

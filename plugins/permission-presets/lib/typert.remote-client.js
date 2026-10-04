@@ -8,6 +8,12 @@ const _deepseek_ai_dsh_permission_presets_permissionPresets_catalog_result$schem
   'name': z.string(),
   'description': z.string().optional(),
 })),
+  'defaultOptions': z.array(z.object({
+  'value': z.string(),
+  'name': z.string(),
+  'description': z.string().optional(),
+})),
+  'defaultPreset': z.string(),
 }))
 
 export const TYPERT_REMOTE = {
@@ -26,7 +32,7 @@ export const TYPERT_REMOTE = {
         typeSymbol: '@deepseek-ai/dsh-permission-presets/client#PermissionCatalog',
         create: _deepseek_ai_dsh_permission_presets_permissionPresets_catalog_result$schema,
       },
-      sourceLocation: {"file":"packages/interaction/permission-presets/src/index.ts","line":312,"column":3},
+      sourceLocation: {"file":"packages/interaction/permission-presets/src/index.ts","line":295,"column":3},
     },
   ],
 }

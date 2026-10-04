@@ -1,16 +1,4 @@
-/**
- * User-facing permission presets over the independent sandbox-mode and
- * approval-policy knobs. A switch records the selected preset, then writes
- * changed knobs through their canonical setters. Execution, prompt narration,
- * and replay keep reading their knob folds. The preset event preserves user
- * intent when two presets share a bundle. The Auto review integration may
- * publish one fixed, current-session-only preset with a synchronous admission
- * check; settings defaults remain limited to the configured table. The read
- * side exposes a process catalog plus the current-value-only `permissions`
- * Session projection; the write side ships as the `/permission` command.
- *
- * @module dsh-permission-presets
- */
+import type { Volatile } from '@deepseek-ai/cordis';
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
@@ -61,8 +49,6 @@ export interface PresetSpec {
 export declare const CUSTOM_PRESET = "custom";
 /** Canonical identity of the experimental per-call review preset. */
 export declare const AUTO_PRESET = "auto";
-/** Settings namespace carrying the default for future sessions. */
-export declare const PERMISSION_SETTINGS_NAMESPACE = "permission";
 /**
  * The projection unit's knob state: the last seen value of each knob event,
  * null before an override (composition defaults apply at view time).
@@ -93,12 +79,12 @@ export interface Config {
      * never). The names `custom` and `auto` are reserved for derived state and
      * the Auto review integration respectively.
      */
-    presets?: Record<string, PresetSpec>;
+    presets: Record<string, PresetSpec>;
     /**
      * Default for new sessions. When omitted, the preset matching the composed
      * sandbox and approval defaults is used.
      */
-    defaultPreset?: string;
+    defaultPreset: Volatile<string | undefined>;
 }
 /**
  * Owns the deployment's configured permission presets, the fixed Auto
@@ -107,13 +93,38 @@ export interface Config {
  * {@link CUSTOM_PRESET}, not an error.
  */
 export declare class PermissionPresetService extends TypertRemoteService {
-    static Config: z<Config>;
+    static Config: z<Schemastery.ObjectS<NoInfer<{
+        presets: z<import("@deepseek-ai/cosmokit").Dict<{
+            sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
+            approval?: "ask" | "never" | null;
+            name?: string | null;
+            description?: string | null;
+        } & import("@deepseek-ai/cosmokit").Dict, string>, import("@deepseek-ai/cosmokit").Dict<Schemastery.ObjectT<NoInfer<{
+            sandbox: z<"read-only" | "workspace-write" | "danger-full-access", "read-only" | "workspace-write" | "danger-full-access", "defined">;
+            approval: z<"ask" | "never", "ask" | "never", "defined">;
+            name: z<string, string, "plain">;
+            description: z<string, string, "plain">;
+        }>>, string>, "defined">;
+        defaultPreset: z<string, string, "volatile">;
+    }>>, Schemastery.ObjectT<NoInfer<{
+        presets: z<import("@deepseek-ai/cosmokit").Dict<{
+            sandbox?: "read-only" | "workspace-write" | "danger-full-access" | null;
+            approval?: "ask" | "never" | null;
+            name?: string | null;
+            description?: string | null;
+        } & import("@deepseek-ai/cosmokit").Dict, string>, import("@deepseek-ai/cosmokit").Dict<Schemastery.ObjectT<NoInfer<{
+            sandbox: z<"read-only" | "workspace-write" | "danger-full-access", "read-only" | "workspace-write" | "danger-full-access", "defined">;
+            approval: z<"ask" | "never", "ask" | "never", "defined">;
+            name: z<string, string, "plain">;
+            description: z<string, string, "plain">;
+        }>>, string>, "defined">;
+        defaultPreset: z<string, string, "volatile">;
+    }>>, "plain">;
     static inject: string[];
     private readonly presets;
     private autoAdmit;
     private defaultSettings;
-    /** The preset a fresh session falls back to when its stored default has no live definition. */
-    private compositionDefault;
+    private readonly compositionDefault;
     constructor(ctx: Context, config: Config);
     /**
      * The advertised preset names: configured entries in declaration order,
@@ -142,7 +153,8 @@ export declare class PermissionPresetService extends TypertRemoteService {
     private permissionState;
     /**
      * Resolve the preset matching the effective knob values. A still-matching
-     * last selection wins shared-bundle ties; otherwise the first configured
+     * last selection wins shared-bundle ties, and a still-selected Auto also
+     * matches the `never` approval policy; otherwise the first configured
      * match wins. Returns
      * {@link CUSTOM_PRESET} when no available preset matches.
      * @param session - the session whose knob state is read.
@@ -190,3 +202,4 @@ export declare class PermissionPresetService extends TypertRemoteService {
     private specOf;
 }
 export default PermissionPresetService;
+//# sourceMappingURL=index.d.ts.map

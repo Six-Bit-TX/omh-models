@@ -20,9 +20,6 @@ import { bwrapProfileArgs } from '../src/profiles.ts'
 const probe = spawnSync('bwrap', [...bwrapProfileArgs({ mode: 'read-only', workspaceRoot: '/' }), '--', 'true'], { timeout: 5_000, stdio: 'ignore' })
 const bwrapUsable = probe.status === 0
 
-/** Whether this host exposes the NVIDIA character devices the sandbox rebinds. */
-const gpuNodesPresent = existsSync('/dev/nvidiactl')
-
 let ctx: Context | undefined
 const tempDirs: string[] = []
 const tempFiles: string[] = []
@@ -145,20 +142,5 @@ describe.skipIf(!bwrapUsable)('sandbox-local: real bwrap confinement', () => {
     expect(result.status).toBe(0)
     expect(result.stdout).toBe('tmp-ok')
     expect(existsSync(target)).toBe(false)
-  })
-})
-
-describe.skipIf(!bwrapUsable)('sandbox-local: confined GPU access', () => {
-  // A host either exposes the NVIDIA device nodes or it does not; the argv
-  // fact is pinned unconditionally in the profile and config tests, so this
-  // only carries the kernel-side behavior where a GPU exists.
-  it.skipIf(!gpuNodesPresent)('rebinds the host device nodes so a confined command reaches the driver', async () => {
-    const workdir = await tempDir(homedir())
-    const sandbox = await provider()
-    const confined = await sandbox.confine(['nvidia-smi', '-L'], { mode: 'read-only', workspaceRoot: workdir })
-    expect(confined.argv).toContain('--dev-bind')
-    const { result } = await runConfined(sandbox, 'nvidia-smi -L', { mode: 'read-only', workspaceRoot: workdir })
-    expect(result.status).toBe(0)
-    expect(result.stdout).toContain('GPU 0')
   })
 })

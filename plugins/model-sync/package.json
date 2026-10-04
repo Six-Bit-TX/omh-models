@@ -22,6 +22,8 @@
     "scripts",
     "vendor",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "config.js",
+    "auth.js"
   ]
 }

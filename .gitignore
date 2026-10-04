@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 *.tgz
 __pycache__/
 *.pyc
@@ -8,3 +8,4 @@ __pycache__/
 .pytest_cache/
 *.log
 .DS_Store
+*.tsbuildinfo

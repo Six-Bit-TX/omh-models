@@ -1,13 +1,14 @@
 {
   "repository": "https://github.com/deepseek-ai/deepseek-harness",
-  "baseCommit": "62e7d3440cb127c728bdd7d11dac81b2211b493a",
-  "apiVersion": "0.1.6-alpha.1",
-  "source": "OMH working tree, including implemented local changes",
+  "baseCommit": "5badb15009ae1756c3afe0ae0cef1faafc290ccc",
+  "apiVersion": "0.2.1-alpha.1",
+  "source": "Latest upstream source with OMH feature adaptations",
   "packages": {
     "ui-model-selection": "packages/client/ui-model-selection",
     "ui-settings-plugins": "packages/client/ui-settings-plugins",
     "permission-presets": "packages/interaction/permission-presets",
     "sandbox-local": "packages/sandbox/sandbox-local",
-    "model-sync": "overlay/plugins/dsh-model-sync"
+    "model-sync": "overlay/plugins/dsh-model-sync",
+    "ui-settings-subagent": "packages/client/ui-settings-subagent"
   }
 }

@@ -15,8 +15,9 @@
  * session); the private-temp ACEs are revoked on dispose. The runner
  * receives both SIDs (their presence marks the seam-managed contract) and
  * stops managing DACLs itself. The rung reports partial enforcement because
- * WRITE_RESTRICTED must retain Everyone in its
- * restricting list and NTFS hard links alias one file object across paths.
+ * NTFS hard links alias one file object across paths, reads stay unconfined,
+ * and a tree another AppContainer tool has ACL'd with a package SID is not
+ * readable by the Low-integrity child.
  * @module @deepseek-ai/dsh-sandbox-local
  */
 import { Context } from '@deepseek-ai/cordis';
@@ -210,3 +211,4 @@ export declare class LocalSandboxProvider extends SandboxProvider {
     private windowsAclRunnerInvocation;
 }
 export default LocalSandboxProvider;
+//# sourceMappingURL=index.d.ts.map

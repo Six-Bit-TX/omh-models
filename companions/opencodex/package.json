@@ -1,0 +1,17 @@
+{
+  "name": "@omh/models-opencodex-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "setup": "node cli.mjs setup",
+    "doctor": "node cli.mjs doctor",
+    "start": "node cli.mjs start",
+    "login": "node cli.mjs login",
+    "test": "node --test companion.test.mjs",
+    "test:bun": "node cli.mjs test-bun"
+  },
+  "dependencies": { "@bitkyc08/opencodex": "2.68.0" }
+}

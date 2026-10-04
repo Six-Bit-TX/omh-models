@@ -37,7 +37,7 @@ const MODALITIES = ["text", "image"];
 export const ROUTES = ["opencodex", "cursor"];
 
 /** The settings namespace holding which routes a delegated child may select. */
-export const POLICY_NS = "subagent-model-selection";
+export const POLICY_NS = "subagent-model-selection-settings";
 
 /**
  * The OMH provider route a published row belongs to, or `undefined` when the id
@@ -135,7 +135,7 @@ function groupPublished(rows, routes) {
   const grouped = new Map(routes.map((route) => [route, []]));
   const seen = new Set();
   for (const row of Array.isArray(rows) ? rows : []) {
-    if (typeof row?.id !== "string") continue;
+    if (typeof row?.id !== "string" || row.id.trim() !== row.id || row.id.length === 0 || /[\u0000-\u001f]/.test(row.id)) continue;
     // Resolution marks a duplicated id as an error and filters BOTH copies out of
     // the servable list, so a repeated row would silently retire a working model.
     if (seen.has(row.id)) continue;

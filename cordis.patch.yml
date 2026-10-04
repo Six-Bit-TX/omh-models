@@ -1,7 +1,9 @@
-# Apply after the 0.1.6-alpha.1 Web bundle.
+# Apply after the 0.2.1-alpha.1 Web bundle.
 - id: ui-model-selection
   disabled: true
 - id: ui-settings-plugins
+  disabled: true
+- id: ui-settings-subagent
   disabled: true
 - id: permission
   disabled: true
@@ -14,6 +16,8 @@
       name: ./plugins/ui-model-selection/lib/index.js
     - id: omh-models-ui-settings-plugins
       name: ./plugins/ui-settings-plugins/lib/index.js
+    - id: omh-models-ui-settings-subagent
+      name: ./plugins/ui-settings-subagent/lib/index.js
     - id: omh-models-permission
       name: ./plugins/permission-presets/lib/index.js
       config:
@@ -36,3 +40,4 @@
       config:
         bridge: http://127.0.0.1:10100/v1/models
         routes: [opencodex, cursor]
+        refreshIntervalMs: 300000

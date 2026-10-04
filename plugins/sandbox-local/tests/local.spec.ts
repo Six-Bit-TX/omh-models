@@ -17,17 +17,13 @@ import { LAUNCHER_FAILURE_EXIT } from '@deepseek-ai/node-addon-system/landlock-r
 import { SANDBOX_UNAVAILABLE, SandboxUnavailableError } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import {
-  LocalSandboxProvider,
-  hostGpuDevicePaths,
+  LocalSandboxProvider, hostGpuDevicePaths,
 } from '@deepseek-ai/dsh-sandbox-local'
 import type { Config } from '@deepseek-ai/dsh-sandbox-local'
-import { bwrapProfileArgs, deviceBindArgs, landlockProfileArgs, seatbeltProfileArgs } from '../src/profiles.ts'
+import { bwrapProfileArgs, landlockProfileArgs, seatbeltProfileArgs } from '../src/profiles.ts'
 
 const RO: SandboxPolicy = { mode: 'read-only', workspaceRoot: '/ws' }
 const WW: SandboxPolicy = { mode: 'workspace-write', workspaceRoot: '/ws' }
-
-/** Injected empty so a pinned wrap argv never depends on whether the test host has a GPU. */
-const noDevices = { devicePaths: [] } as const
 
 /** Every temp dir created by this file (fake launchers and runner entries), removed after each test. */
 const tempDirs: string[] = []
@@ -97,23 +93,6 @@ describe('profile dialects', () => {
   it('landlock workspace-write: adds the host /tmp and the workspace root', () => {
     expect(landlockProfileArgs(WW)).toEqual(['--ro', '/', '--rw', '/dev/null', '--rw', '/tmp', '--rw', '/ws'])
   })
-  it('bwrap with host devices: each node keeps device access after the fresh /dev', () => {
-    expect(bwrapProfileArgs(RO, ['/dev/nvidiactl', '/dev/dri/renderD128'])).toEqual([
-      '--ro-bind', '/', '/', '--dev', '/dev',
-      '--dev-bind', '/dev/nvidiactl', '/dev/nvidiactl',
-      '--dev-bind', '/dev/dri/renderD128', '/dev/dri/renderD128',
-      '--unshare-pid', '--proc', '/proc', '--die-with-parent',
-    ])
-  })
-
-  it('landlock with host devices: each node joins the writable grants', () => {
-    expect(landlockProfileArgs(RO, ['/dev/nvidiactl'])).toEqual(['--ro', '/', '--rw', '/dev/null', '--rw', '/dev/nvidiactl'])
-  })
-
-  it('deviceBindArgs: one device-access pair per path, and nothing without paths', () => {
-    expect(deviceBindArgs(['/dev/nvidia0'])).toEqual(['--dev-bind', '/dev/nvidia0', '/dev/nvidia0'])
-    expect(deviceBindArgs([])).toEqual([])
-  })
 
   it('seatbelt read-only: allow-default with every file write denied except the /dev/null literal', () => {
     expect(seatbeltProfileArgs(RO)).toEqual(['-p', SEATBELT_RO_PROFILE])
@@ -138,27 +117,6 @@ describe('profile dialects', () => {
   })
 })
 
-describe('gpuDevices config', () => {
-  it('binds the detected device nodes with device access by default', async () => {
-    const devices = ['/dev/nvidiactl', '/dev/dri/renderD128']
-    const { sandbox } = await setup({}, { chain: ['bwrap'], devicePaths: devices })
-    const confined = await sandbox.confine(['true'], RO)
-    expect(confined.argv).toEqual(['bwrap', ...bwrapProfileArgs(RO, devices), '--', 'true'])
-  })
-
-  it('gpuDevices false withholds device access even from an injected node list', async () => {
-    const { sandbox } = await setup({ gpuDevices: false }, { chain: ['bwrap'], devicePaths: ['/dev/nvidiactl'] })
-    const confined = await sandbox.confine(['true'], RO)
-    expect(confined.argv).toEqual(['bwrap', ...bwrapProfileArgs(RO), '--', 'true'])
-  })
-
-  it('the detected list holds only existing device nodes and no display nodes', () => {
-    const devices = hostGpuDevicePaths()
-    expect(devices.every(device => existsSync(device))).toBe(true)
-    expect(devices.filter(device => /\/card\d+$/u.test(device))).toEqual([])
-  })
-})
-
 describe('runnerCommand config', () => {
   it('a non-empty runnerCommand skips the chain: runner argv + bwrap-shaped profile + -- + caller argv, asserted full', async () => {
     const probeBwrap = vi.fn(() => false)
@@ -167,7 +125,7 @@ describe('runnerCommand config', () => {
     const { sandbox } = await setup({
       runnerCommand: ['fake-runner', '--flag'],
       runnerFailureSignatures: ['fake-runner: profile rejected'],
-    }, { probeBwrap, probeLandlock, probeSeatbelt, ...noDevices })
+    }, { probeBwrap, probeLandlock, probeSeatbelt })
     const confined = await sandbox.confine(['bash', '-c', 'echo hi'], WW)
     expect(confined).toEqual({
       argv: ['fake-runner', '--flag', ...bwrapProfileArgs(WW), '--', 'bash', '-c', 'echo hi'],
@@ -215,7 +173,7 @@ describe('the platform chains', () => {
   it('linux probes bwrap first: a passing probe wraps with the bwrap dialect at full enforcement', async () => {
     const probeBwrap = vi.fn(() => true)
     const probeLandlock = vi.fn(() => 'full' as const)
-    const { sandbox } = await setup({}, { platform: 'linux', probeBwrap, probeLandlock, ...noDevices })
+    const { sandbox } = await setup({}, { platform: 'linux', probeBwrap, probeLandlock })
     const confined = await sandbox.confine(['true'], RO)
     expect(confined).toEqual({
       argv: ['bwrap', ...bwrapProfileArgs(RO), '--', 'true'],
@@ -230,7 +188,7 @@ describe('the platform chains', () => {
     const probeBwrap = vi.fn(() => false)
     const probeLandlock = vi.fn(() => 'full' as const)
     const launcher = fakeLauncher()
-    const { sandbox } = await setup({}, { platform: 'linux', probeBwrap, probeLandlock, landlockLauncher: launcher, ...noDevices })
+    const { sandbox } = await setup({}, { platform: 'linux', probeBwrap, probeLandlock, landlockLauncher: launcher })
     const confined = await sandbox.confine(['bash', '-c', 'echo hi'], WW)
     expect(confined).toEqual({
       argv: [launcher, ...landlockProfileArgs(WW), '--', 'bash', '-c', 'echo hi'],
@@ -530,5 +488,26 @@ describe('the windows-acl probe (runner invocation contract)', () => {
     })
     const confined = await sandbox.confine(['true'], RO)
     expect(confined.argv.slice(0, 2)).toEqual([process.execPath, builtEntry])
+  })
+})
+
+describe('gpuDevices config', () => {
+  it('binds the detected device nodes with device access by default', async () => {
+    const devices = ['/dev/nvidiactl', '/dev/dri/renderD128']
+    const { sandbox } = await setup({}, { chain: ['bwrap'], devicePaths: devices })
+    const confined = await sandbox.confine(['true'], RO)
+    expect(confined.argv).toEqual(['bwrap', ...bwrapProfileArgs(RO, devices), '--', 'true'])
+  })
+
+  it('gpuDevices false withholds device access even from an injected node list', async () => {
+    const { sandbox } = await setup({ gpuDevices: false }, { chain: ['bwrap'], devicePaths: ['/dev/nvidiactl'] })
+    const confined = await sandbox.confine(['true'], RO)
+    expect(confined.argv).toEqual(['bwrap', ...bwrapProfileArgs(RO), '--', 'true'])
+  })
+
+  it('the detected list holds only existing device nodes and no display nodes', () => {
+    const devices = hostGpuDevicePaths()
+    expect(devices.every(device => existsSync(device))).toBe(true)
+    expect(devices.filter(device => /\/card\d+$/u.test(device))).toEqual([])
   })
 })

@@ -7,3 +7,4 @@
  * @module @deepseek-ai/dsh-permission-presets/client
  */
 export type * from './types.ts';
+//# sourceMappingURL=client.d.ts.map

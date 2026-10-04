@@ -35,3 +35,4 @@ export declare function landlockProfileArgs(policy: SandboxPolicy, devices?: rea
  * @returns sandbox-exec arguments before the trailing separator and command argv.
  */
 export declare function seatbeltProfileArgs(policy: SandboxPolicy): string[];
+//# sourceMappingURL=profiles.d.ts.map

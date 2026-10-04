@@ -18,7 +18,7 @@ for (const [owner, original] of Object.entries(catalog.packages)) {
   if (created) symlinkSync(join(runtime, original, 'node_modules'), modules, 'dir')
   const config = join(target, '.build.config.ts')
   const preset = pathToFileURL(join(runtime, 'packages/client/tsdown.client.ts')).href
-  writeFileSync(config, `import { clientBundle } from ${JSON.stringify(preset)}\nexport default clientBundle(${JSON.stringify(packageJson.name)}, ['src/index.ts'])({})\n`)
+  writeFileSync(config, `import { clientBundle } from ${JSON.stringify(preset)}\nexport default clientBundle(${JSON.stringify(packageJson.name)}, ['lib/types/index.js'])({}).map(config => ({ ...config, tsconfig: ${JSON.stringify(join(runtime, original, 'tsconfig.json'))} }))\n`)
   try {
     const result = spawnSync(process.execPath, [join(runtime, 'node_modules/tsdown/dist/run.mjs'), '--config', config], { cwd: target, stdio: 'inherit' })
     if (result.error) throw result.error

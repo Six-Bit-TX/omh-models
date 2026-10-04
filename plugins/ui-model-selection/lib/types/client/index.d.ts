@@ -20,3 +20,4 @@ export declare const inject: string[];
  * @param ctx - client root context.
  */
 export declare function apply(ctx: ClientContext): void;
+//# sourceMappingURL=index.d.ts.map

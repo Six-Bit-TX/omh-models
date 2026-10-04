@@ -15,8 +15,9 @@
  * session); the private-temp ACEs are revoked on dispose. The runner
  * receives both SIDs (their presence marks the seam-managed contract) and
  * stops managing DACLs itself. The rung reports partial enforcement because
- * WRITE_RESTRICTED must retain Everyone in its
- * restricting list and NTFS hard links alias one file object across paths.
+ * NTFS hard links alias one file object across paths, reads stay unconfined,
+ * and a tree another AppContainer tool has ACL'd with a package SID is not
+ * readable by the Low-integrity child.
  * @module @deepseek-ai/dsh-sandbox-local
  */
 import { spawnSync } from 'node:child_process';
@@ -27,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { LAUNCHER_BIN, LAUNCHER_FAILURE_EXIT, launcherPath as landlockLauncherPath, probe as defaultProbeLandlock, } from '@deepseek-ai/node-addon-system/landlock-run';
 import z from '@deepseek-ai/schemastery';
 import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox';
-import { AclWriteGrant, assertTempRootOutsideWorkspace, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl';
+import { AclWriteGrant, assertTempRootOutsideWorkspace, registerAclDiagnosisSkill, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl';
 import { assertNever } from '@deepseek-ai/dsh-util-values';
 import { bwrapProfileArgs, landlockProfileArgs, seatbeltProfileArgs } from "./profiles.js";
 /** Probe whether `bwrap` can create the profile; the provider caches the bounded result. */
@@ -105,11 +106,12 @@ const STATIC_ENFORCEMENT = {
     bwrap: 'full',
     landlock: 'full',
     seatbelt: 'full',
-    // WRITE_RESTRICTED needs Everyone in both restricting lists for process
-    // initialization. An external object that grants Everyone write access
-    // therefore remains writable, and NTFS hard links can alias a granted
-    // workspace file to a path outside it. The backend enforces the remaining
-    // ACL-addressable surface but must not advertise the absolute promise.
+    // Everyone stays in both restricting lists for process initialization, but
+    // the Low label denies the write authority it used to confer. NTFS hard
+    // links still alias a granted workspace file to a path outside it, reads
+    // stay unconfined, and an AppContainer-ACL'd tree is unreadable to the
+    // child: the backend enforces the remaining ACL-addressable surface but
+    // must not advertise the absolute promise.
     'windows-acl': 'partial',
 };
 /**
@@ -242,6 +244,12 @@ export class LocalSandboxProvider extends SandboxProvider {
         this.configuredRunnerFailureSignatures = runnerFailureSignatures;
         this.probeTimeoutMs = config.probeTimeoutMs;
         assertPositiveFinite('probeTimeoutMs', this.probeTimeoutMs);
+        // An operator-supplied runner does not use the ACL backend. The registry
+        // remains optional and may be mounted after this provider.
+        /* v8 ignore next 3 -- Windows-only registration; the Linux coverage lane cannot take this branch */
+        if (process.platform === 'win32' && this.runnerCommand === undefined) {
+            ctx.inject(['skills'], (skillsCtx) => { registerAclDiagnosisSkill(skillsCtx); });
+        }
         this.gpuDevices = config.gpuDevices;
         // The temp grants are revoked with the provider: a clean server
         // shutdown leaves no temp ACEs behind (workspace ACEs stand by design —
@@ -473,7 +481,8 @@ export class LocalSandboxProvider extends SandboxProvider {
         // every promised file effect by construction, so their passing probes
         // are always full enforcement; the Landlock launcher's probe report
         // distinguishes full from per-ABI-partial, while windows-acl is always
-        // partial for its documented Everyone and hard-link boundaries.
+        // partial for its documented hard-link, unconfined-read, and
+        // AppContainer-ACL boundaries.
         switch (runner) {
             case 'bwrap': {
                 const probe = this.internals.probeBwrap ?? (() => defaultProbeBwrap(this.probeTimeoutMs, this.devicePaths()));

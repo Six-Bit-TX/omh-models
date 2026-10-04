@@ -9,3 +9,4 @@ import type { ModelSelectInjected } from './slots.ts';
 export declare function ModelSelect({ locked, available, directory, load, select, t }: ModelSelectInjected & {
     locked: boolean;
 } & PropsLocale<'model'>): import("react").JSX.Element | null;
+//# sourceMappingURL=ModelSelect.d.ts.map

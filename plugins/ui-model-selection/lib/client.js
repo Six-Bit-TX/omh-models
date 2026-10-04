@@ -10,6 +10,703 @@ window.__ModuleLoader__.load({
 		let react = require("react");
 		let react_dom = require("react-dom");
 		let react_jsx_runtime = require("react/jsx-runtime");
+		//#region ../../../../../deepseek-harness-latest/packages/util/values/src/partial-json.ts
+		/**
+		* Lazily scanned view of one JSON object's top-level fields, built from text
+		* that may still be streaming or from an already parsed object. Nothing is
+		* scanned until a reader asks; the view remembers every question it answered
+		* and reports changed answers when the owner refreshes for publication.
+		* Used for model tool-call arguments: a row reads the fields it
+		* cares about at whatever granularity it displays, at every stage of the call.
+		* @module @deepseek-ai/dsh-util-values/src/partial-json
+		*/
+		const SIMPLE_ESCAPES = {
+			"\"": "\"",
+			"\\": "\\",
+			"/": "/",
+			b: "\b",
+			f: "\f",
+			n: "\n",
+			r: "\r",
+			t: "	"
+		};
+		const CONTENT_ESCAPE = /[\\\u0000-\u001f]/u;
+		function isWhitespace(c) {
+			return c === " " || c === "\n" || c === "\r" || c === "	";
+		}
+		function isHex(c) {
+			return c >= "0" && c <= "9" || c >= "a" && c <= "f" || c >= "A" && c <= "F";
+		}
+		(class PartialArguments {
+			/** The view of a call with no arguments available. */
+			static EMPTY = PartialArguments.fromObject({});
+			/**
+			* View finished argument text without scanning it until a reader asks.
+			* @param text - the complete argument JSON text.
+			* @returns a sealed view.
+			*/
+			static fromText(text) {
+				const view = new PartialArguments();
+				view.append(text);
+				view.sealed = true;
+				return view;
+			}
+			/**
+			* View an already parsed argument payload, such as a PTC dispatch object.
+			* @param value - the parsed argument value.
+			* @returns a sealed view; a non-object payload has no fields.
+			*/
+			static fromObject(value) {
+				const view = new PartialArguments();
+				view.object = typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+				view.sealed = true;
+				return view;
+			}
+			/**
+			* The source: text so far or a parsed object, plus whether it can still grow.
+			* These are the only enumerable fields, so two views over the same source
+			* compare equal structurally however far each has been read.
+			*/
+			chunks = [];
+			object;
+			sealed = false;
+			#ends = [];
+			#size = 0;
+			#consumed = 0;
+			#mode = "root";
+			#escape = false;
+			#keyStart = 0;
+			#keyEscaped = false;
+			#key = "";
+			#current = null;
+			#nestedEnds = [];
+			#nestedInString = false;
+			#invalidAt;
+			#invalidValue = false;
+			#entries = /* @__PURE__ */ new Map();
+			#order = [];
+			#reads = /* @__PURE__ */ new Map();
+			/** Whether this view rejects further appends; does not scan text or register reads. */
+			get isSealed() {
+				return this.sealed;
+			}
+			/** Whether indexing or a content read found invalid JSON; unread value contents are not validated. */
+			get invalid() {
+				this.scan();
+				return this.#mode === "invalid" || this.#invalidValue;
+			}
+			/**
+			* Retain streamed argument text without scanning or comparing observed answers.
+			* @param fragment - the text following every fragment appended before.
+			*/
+			append(fragment) {
+				if (this.sealed) throw new Error("PartialArguments: cannot append to a sealed view");
+				if (fragment.length === 0) return;
+				this.chunks.push(fragment);
+				this.#size += fragment.length;
+				this.#ends.push(this.#size);
+			}
+			/**
+			* Reconcile a streamed prefix with authoritative complete text without joining the fragments.
+			* @param text - the final argument text, which replaces missing or conflicting deltas.
+			* @returns this view sealed with its caches retained when every character matches; otherwise a new sealed view.
+			*/
+			settle(text) {
+				if (this.object !== void 0 || text.length !== this.#size) return PartialArguments.fromText(text);
+				let offset = 0;
+				for (const chunk of this.chunks) {
+					if (!text.startsWith(chunk, offset)) return PartialArguments.fromText(text);
+					offset += chunk.length;
+				}
+				this.chunks = text.length === 0 ? [] : [text];
+				this.#ends = text.length === 0 ? [] : [text.length];
+				this.sealed = true;
+				return this;
+			}
+			/**
+			* Compare observed answers and advance their publication baseline. Unread views remain unscanned.
+			* @returns whether any observed answer changed since its first read or the preceding refresh.
+			*/
+			refresh() {
+				if (this.#reads.size === 0) return false;
+				this.scan();
+				let changed = false;
+				let completions = false;
+				for (const read of this.#reads.values()) {
+					if (read.completion) {
+						completions = true;
+						continue;
+					}
+					changed = this.refreshRead(read) || changed;
+				}
+				if (completions) {
+					for (const read of this.#reads.values()) if (read.completion) changed = this.refreshRead(read) || changed;
+				}
+				if (this.sealed) this.#reads.clear();
+				return changed;
+			}
+			refreshRead(read) {
+				const now = read.answer();
+				if (Object.is(now, read.last)) return false;
+				read.last = now;
+				return true;
+			}
+			/**
+			* Check whether no further fields can arrive.
+			* @returns whether the outer object closed, indexing failed, or the view is sealed; unread values are not validated.
+			*/
+			closed() {
+				return this.remember("closed", "", () => this.closedNow());
+			}
+			/**
+			* List discovered fields in first-appearance order.
+			* @returns top-level keys seen so far, in first-appearance order.
+			*/
+			keys() {
+				return this.remember("keys", "", () => this.keysNow(), (keys) => keys.length);
+			}
+			/**
+			* Check whether a top-level field has appeared.
+			* @param key - argument name.
+			* @returns whether the field has appeared (a string opened or another value began).
+			*/
+			has(key) {
+				return this.remember("has", key, () => this.hasNow(key));
+			}
+			/**
+			* Check whether a field's closing delimiter has arrived, without validating its contents.
+			* @param key - argument name.
+			* @returns whether its delimiter arrived and no content reader has reported an error for this value.
+			*/
+			complete(key) {
+				return this.remember("complete", key, () => this.completeNow(key));
+			}
+			/**
+			* Read string length without materializing its text.
+			* @param key - argument name.
+			* @param options - change granularity for a streaming string.
+			* @returns decoded UTF-16 length of the string field so far; undefined when absent or not a string.
+			*/
+			stringLength(key, options) {
+				const step = Math.max(1, Math.floor(options?.step ?? 1));
+				const offset = options?.offset ?? 0;
+				return this.remember(`length:${step}:${offset}`, key, () => this.lengthNow(key), (length) => length === void 0 ? void 0 : Math.ceil((length + offset) / step));
+			}
+			/**
+			* Check a string against a decoded UTF-16 length limit without materializing it.
+			* @param key - argument name.
+			* @param maxLength - decoded UTF-16 limit, floored to at least zero.
+			* @returns whether the string is longer than the limit; false when absent or not a string.
+			*/
+			stringExceeds(key, maxLength) {
+				const limit = Math.max(0, Math.floor(maxLength));
+				return this.remember(`exceeds:${limit}`, key, () => (this.lengthNow(key, limit + 1) ?? 0) > limit);
+			}
+			/**
+			* Read a decoded string, including a streaming prefix.
+			* @param key - argument name.
+			* @returns the string field's decoded text so far; undefined when absent or not a string.
+			*/
+			text(key) {
+				return this.remember("text", key, () => this.textNow(key));
+			}
+			/**
+			* Read at most the first decoded UTF-16 units of a string.
+			* @param key - argument name.
+			* @param maxLength - maximum decoded UTF-16 length, floored to at least one.
+			* @returns the bounded string prefix; undefined when absent or not a string.
+			*/
+			textPrefix(key, maxLength) {
+				const limit = Math.max(1, Math.floor(maxLength));
+				return this.remember(`prefix:${limit}`, key, () => this.textPrefixNow(key, limit));
+			}
+			/**
+			* Read a completed non-string argument.
+			* @param key - argument name.
+			* @returns the parsed non-string value once it closed; undefined while open, absent, or a string.
+			*/
+			value(key) {
+				return this.remember("value", key, () => this.valueNow(key));
+			}
+			/** Answer a question and, on a streaming view, remember it for change detection. */
+			remember(kind, key, read, comparison) {
+				this.scan();
+				const result = read();
+				if (!this.sealed) {
+					const id = `${kind}/${key}`;
+					if (!this.#reads.has(id)) this.#reads.set(id, {
+						completion: kind === "complete",
+						answer: comparison === void 0 ? read : () => comparison(read()),
+						last: comparison === void 0 ? result : comparison(result)
+					});
+				}
+				return result;
+			}
+			closedNow() {
+				return this.sealed || this.#mode === "closed" || this.#mode === "invalid";
+			}
+			keysNow() {
+				return this.object === void 0 ? this.#order : Object.keys(this.object);
+			}
+			hasNow(key) {
+				return this.object === void 0 ? this.#entries.has(key) : Object.hasOwn(this.object, key);
+			}
+			completeNow(key) {
+				if (this.object !== void 0) return Object.hasOwn(this.object, key);
+				const entry = this.#entries.get(key);
+				return entry !== void 0 && entry.end >= 0 && (entry.kind === "string" ? entry.invalidAt === void 0 : !entry.invalid);
+			}
+			lengthNow(key, limit = Number.POSITIVE_INFINITY) {
+				if (this.object !== void 0) {
+					const field = Object.hasOwn(this.object, key) ? this.object[key] : void 0;
+					return typeof field === "string" ? field.length : void 0;
+				}
+				const entry = this.#entries.get(key);
+				if (entry?.kind !== "string") return void 0;
+				if (entry.text !== void 0 && entry.text.at === entry.end) return entry.text.length;
+				const read = entry.length ??= {
+					at: entry.start,
+					length: 0,
+					text: ""
+				};
+				this.readString(entry, read, limit, false);
+				return read.length;
+			}
+			textNow(key) {
+				if (this.object !== void 0) {
+					const field = Object.hasOwn(this.object, key) ? this.object[key] : void 0;
+					return typeof field === "string" ? field : void 0;
+				}
+				const entry = this.#entries.get(key);
+				if (entry?.kind !== "string") return void 0;
+				if (entry.text === void 0 && entry.end >= 0 && entry.needsDecoding && entry.invalidAt === void 0) {
+					let text;
+					try {
+						text = JSON.parse(`"${this.slice(entry.start, entry.end)}"`);
+					} catch (_error) {}
+					if (text !== void 0) entry.text = {
+						at: entry.end,
+						length: text.length,
+						text
+					};
+				}
+				const read = entry.text ??= {
+					at: entry.start,
+					length: 0,
+					text: ""
+				};
+				this.readString(entry, read, Number.POSITIVE_INFINITY, true);
+				return read.text;
+			}
+			textPrefixNow(key, maxLength) {
+				if (this.object !== void 0) {
+					const field = Object.hasOwn(this.object, key) ? this.object[key] : void 0;
+					return typeof field === "string" ? field.slice(0, maxLength) : void 0;
+				}
+				const entry = this.#entries.get(key);
+				if (entry?.kind !== "string") return void 0;
+				const prefixes = entry.prefixes ??= /* @__PURE__ */ new Map();
+				let read = prefixes.get(maxLength);
+				if (read === void 0) {
+					read = {
+						at: entry.start,
+						length: 0,
+						text: ""
+					};
+					prefixes.set(maxLength, read);
+				}
+				this.readString(entry, read, maxLength, true);
+				return read.text;
+			}
+			valueNow(key) {
+				if (this.object !== void 0) {
+					if (!Object.hasOwn(this.object, key)) return void 0;
+					const field = this.object[key];
+					return typeof field === "string" ? void 0 : field;
+				}
+				const entry = this.#entries.get(key);
+				if (entry?.kind !== "value" || entry.end < 0 || entry.invalid) return void 0;
+				if (entry.parsed === void 0) try {
+					entry.parsed = JSON.parse(this.slice(entry.start, entry.end));
+				} catch (_error) {
+					entry.invalid = true;
+					this.#invalidValue = true;
+				}
+				return entry.parsed;
+			}
+			chunkAt(at) {
+				let low = 0;
+				let high = this.#ends.length;
+				while (low < high) {
+					const mid = low + high >>> 1;
+					if (this.#ends[mid] <= at) low = mid + 1;
+					else high = mid;
+				}
+				return low;
+			}
+			/** Materialize only a requested range, never the cumulative source. */
+			slice(start, end) {
+				if (start >= end) return "";
+				const first = this.chunkAt(start);
+				const last = this.chunkAt(end - 1);
+				const base = first === 0 ? 0 : this.#ends[first - 1];
+				if (first === last) return this.chunks[first].slice(start - base, end - base);
+				const parts = [this.chunks[first].slice(start - base)];
+				for (let i = first + 1; i < last; i++) parts.push(this.chunks[i]);
+				parts.push(this.chunks[last].slice(0, end - this.#ends[last - 1]));
+				return parts.join("");
+			}
+			readString(entry, read, limit, materialize) {
+				const end = Math.min(entry.end < 0 ? this.#consumed : entry.end, entry.invalidAt ?? Number.POSITIVE_INFINITY, this.#invalidAt ?? Number.POSITIVE_INFINITY);
+				if (!entry.needsDecoding) {
+					const length = Math.min(end - read.at, limit - read.length);
+					if (length <= 0) return;
+					if (materialize) read.text += this.slice(read.at, read.at + length);
+					read.at += length;
+					read.length += length;
+					return;
+				}
+				let chunkIndex = this.chunkAt(read.at);
+				while (read.at < end && read.length < limit) {
+					const base = chunkIndex === 0 ? 0 : this.#ends[chunkIndex - 1];
+					const chunk = this.chunks[chunkIndex];
+					const remaining = chunk.slice(read.at - base, Math.min(chunk.length, end - base));
+					const boundary = remaining.search(CONTENT_ESCAPE);
+					const length = Math.min(boundary < 0 ? remaining.length : boundary, limit - read.length);
+					if (length > 0) {
+						if (materialize) read.text += remaining.slice(0, length);
+						read.at += length;
+						read.length += length;
+						if (read.at === base + chunk.length) chunkIndex++;
+						continue;
+					}
+					const type = remaining.length > 1 ? remaining[1] : read.at + 1 < end ? this.chunks[chunkIndex + 1][0] : void 0;
+					let decoded;
+					let width = 2;
+					if (remaining[0] === "\\" && type === void 0 && entry.end < 0) return;
+					if (remaining[0] === "\\" && type === "u") {
+						const hex = this.slice(read.at + 2, Math.min(end, read.at + 6));
+						let valid = true;
+						for (let i = 0; i < hex.length; i++) if (!isHex(hex[i])) valid = false;
+						if (valid) {
+							if (hex.length < 4 && entry.end < 0) return;
+							if (hex.length === 4) decoded = String.fromCharCode(Number.parseInt(hex, 16));
+						}
+						width = 6;
+					} else if (remaining[0] === "\\" && type !== void 0) decoded = SIMPLE_ESCAPES[type];
+					if (decoded === void 0) {
+						entry.invalidAt = read.at;
+						this.#invalidValue = true;
+						return;
+					}
+					if (materialize) read.text += decoded;
+					read.length++;
+					read.at += width;
+					while (chunkIndex < this.chunks.length && read.at >= this.#ends[chunkIndex]) chunkIndex++;
+				}
+			}
+			/** Locate new field ranges without decoding or parsing their contents. */
+			scan() {
+				if (this.object !== void 0 || this.#consumed === this.#size) return;
+				for (let i = this.chunkAt(this.#consumed); i < this.chunks.length && this.#invalidAt === void 0; i++) {
+					const pending = this.chunks[i];
+					const base = i === 0 ? 0 : this.#ends[i - 1];
+					for (let index = this.#consumed - base; index < pending.length && this.#mode !== "invalid"; index++) {
+						if (this.#mode === "string" || this.#mode === "nested" && this.#nestedInString) {
+							const end = this.stringBoundary(pending, index);
+							this.#consumed += end - index;
+							index = end;
+							if (index === pending.length) break;
+						}
+						this.step(pending[index], this.#consumed);
+						this.#consumed++;
+					}
+				}
+			}
+			/** Only raw quotes and their preceding backslash runs can terminate a string. */
+			stringBoundary(fragment, start) {
+				let at = start;
+				while (true) {
+					const quote = fragment.indexOf("\"", at);
+					const end = quote < 0 ? fragment.length : quote;
+					if (this.#mode === "string") {
+						const entry = this.#current;
+						if (!entry.needsDecoding && CONTENT_ESCAPE.test(fragment.slice(at, end))) entry.needsDecoding = true;
+					}
+					let slashStart = end;
+					while (slashStart > at && fragment[slashStart - 1] === "\\") slashStart--;
+					const escaped = (end - slashStart) % 2 === 1 !== (slashStart === at && this.#escape);
+					this.#escape = quote < 0 && escaped;
+					if (quote < 0 || !escaped) return end;
+					at = quote + 1;
+				}
+			}
+			step(c, at) {
+				switch (this.#mode) {
+					case "root":
+						if (isWhitespace(c)) return;
+						if (c === "{") {
+							this.#mode = "key-or-end";
+							return;
+						}
+						this.fail();
+						return;
+					case "key-or-end":
+						if (isWhitespace(c)) return;
+						if (c === "}") {
+							this.#mode = "closed";
+							return;
+						}
+						if (c === "\"") {
+							this.beginKey(at);
+							return;
+						}
+						this.fail();
+						return;
+					case "key-only":
+						if (isWhitespace(c)) return;
+						if (c === "\"") {
+							this.beginKey(at);
+							return;
+						}
+						this.fail();
+						return;
+					case "key":
+						this.stepKey(c, at);
+						return;
+					case "colon":
+						if (isWhitespace(c)) return;
+						if (c === ":") {
+							this.#mode = "value";
+							return;
+						}
+						this.fail();
+						return;
+					case "value":
+						this.beginValue(c, at);
+						return;
+					case "string": {
+						const entry = this.#current;
+						entry.end = at;
+						this.#current = null;
+						this.#mode = "comma-or-end";
+						return;
+					}
+					case "scalar":
+						this.stepScalar(c, at);
+						return;
+					case "nested":
+						this.stepNested(c, at);
+						return;
+					case "comma-or-end":
+						if (isWhitespace(c)) return;
+						if (c === ",") {
+							this.#mode = "key-only";
+							return;
+						}
+						if (c === "}") {
+							this.#mode = "closed";
+							return;
+						}
+						this.fail();
+						return;
+					case "closed":
+						if (isWhitespace(c)) return;
+						this.fail();
+						return;
+					/* v8 ignore next 2 -- scan() stops stepping once the view is invalid. */
+					case "invalid": return;
+					/* v8 ignore next 2 -- Every scanner mode has a handler above. */
+					default: assertNever(this.#mode);
+				}
+			}
+			fail() {
+				this.#invalidAt = this.#consumed;
+				this.#mode = "invalid";
+				this.#current = null;
+			}
+			beginKey(at) {
+				this.#mode = "key";
+				this.#keyStart = at + 1;
+				this.#keyEscaped = false;
+				this.#escape = false;
+			}
+			stepKey(c, at) {
+				if (c < " ") {
+					this.fail();
+					return;
+				}
+				if (this.#escape) {
+					this.#escape = false;
+					return;
+				}
+				if (c === "\\") {
+					this.#escape = true;
+					this.#keyEscaped = true;
+					return;
+				}
+				if (c !== "\"") return;
+				const raw = this.slice(this.#keyStart, at);
+				if (this.#keyEscaped) try {
+					this.#key = JSON.parse(`"${raw}"`);
+				} catch (_error) {
+					this.fail();
+					return;
+				}
+				else this.#key = raw;
+				this.#mode = "colon";
+			}
+			open(entry) {
+				if (!this.#entries.has(this.#key)) this.#order.push(this.#key);
+				this.#entries.set(this.#key, entry);
+				this.#current = entry;
+			}
+			beginValue(c, at) {
+				if (isWhitespace(c)) return;
+				if (c === "\"") {
+					this.open({
+						kind: "string",
+						start: at + 1,
+						end: -1,
+						needsDecoding: false,
+						invalidAt: void 0,
+						length: void 0,
+						text: void 0,
+						prefixes: void 0
+					});
+					this.#escape = false;
+					this.#mode = "string";
+					return;
+				}
+				if (c === "}" || c === "," || c === ":" || c === "]") {
+					this.fail();
+					return;
+				}
+				this.open({
+					kind: "value",
+					start: at,
+					end: -1,
+					parsed: void 0,
+					invalid: false
+				});
+				if (c === "{" || c === "[") {
+					this.#mode = "nested";
+					this.#nestedEnds = [c === "{" ? "}" : "]"];
+					this.#nestedInString = false;
+					this.#escape = false;
+					return;
+				}
+				this.#mode = "scalar";
+			}
+			stepScalar(c, at) {
+				if (c !== "," && c !== "}" && !isWhitespace(c)) return;
+				this.closeValue(at);
+				this.#mode = c === "," ? "key-only" : c === "}" ? "closed" : "comma-or-end";
+			}
+			stepNested(c, at) {
+				if (this.#nestedInString) {
+					this.#nestedInString = false;
+					return;
+				}
+				if (c === "\"") {
+					this.#nestedInString = true;
+					return;
+				}
+				if (c === "{" || c === "[") {
+					this.#nestedEnds.push(c === "{" ? "}" : "]");
+					return;
+				}
+				if (c === "}" || c === "]") {
+					if (this.#nestedEnds.pop() !== c) {
+						this.fail();
+						return;
+					}
+					if (this.#nestedEnds.length === 0) {
+						this.closeValue(at + 1);
+						this.#mode = "comma-or-end";
+					}
+				}
+			}
+			closeValue(end) {
+				const entry = this.#current;
+				entry.end = end;
+				this.#current = null;
+			}
+		});
+		//#endregion
+		//#region ../../../../../deepseek-harness-latest/packages/util/values/src/index.ts
+		/**
+		* Mark an unreachable closed-union branch.
+		* @param value - impossible value; an unhandled typed variant fails at the call site.
+		* @param context - optional switch-site label included in the failure message.
+		* @returns never; a runtime value that escaped its type always throws.
+		*/
+		function assertNever(value, context) {
+			const rendered = JSON.stringify(value) ?? String(value);
+			throw new Error(`unreachable variant${context ? ` in ${context}` : ""}: ${rendered}`);
+		}
+		/**
+		* Weak-key lookup with a strongly retained iterable set of associated values.
+		*
+		* Each value must belong to only one key. The container performs no automatic
+		* cleanup; owners delete associations or clear the container at lifecycle end.
+		*/
+		var WeakMapWithValues = class {
+			keys = /* @__PURE__ */ new WeakMap();
+			valueSet = /* @__PURE__ */ new Set();
+			/** Live strongly retained values in insertion order. */
+			values = this.valueSet;
+			/**
+			* Read the value associated with a key.
+			* @param key - weakly held lookup key.
+			* @returns the associated value, or absence.
+			*/
+			get(key) {
+				return this.keys.get(key);
+			}
+			/**
+			* Test whether a key has an association.
+			* @param key - weakly held lookup key.
+			* @returns whether the key is present.
+			*/
+			has(key) {
+				return this.keys.has(key);
+			}
+			/**
+			* Associate one key with one caller-unique value.
+			* @param key - weakly held lookup key.
+			* @param value - strongly retained value that belongs to no other key.
+			* @returns this container.
+			*/
+			set(key, value) {
+				if (this.keys.has(key)) {
+					const previous = this.keys.get(key);
+					if (previous === value) return this;
+					this.valueSet.delete(previous);
+				}
+				this.keys.set(key, value);
+				this.valueSet.add(value);
+				return this;
+			}
+			/**
+			* Remove one association and its strongly retained value.
+			* @param key - weakly held lookup key.
+			* @returns whether an association was removed.
+			*/
+			delete(key) {
+				if (!this.keys.has(key)) return false;
+				const value = this.keys.get(key);
+				const deleted = this.keys.delete(key);
+				this.valueSet.delete(value);
+				return deleted;
+			}
+			/** Remove every association and strongly retained value. */
+			clear() {
+				this.keys = /* @__PURE__ */ new WeakMap();
+				this.valueSet.clear();
+			}
+		};
+		//#endregion
 		//#region src/client/catalog.ts
 		/** Loads at most one model catalog for the current Host generation. */
 		var ModelCatalogDirectory = class {
@@ -20,6 +717,15 @@ window.__ModuleLoader__.load({
 				status: "idle",
 				error: null
 			});
+			reasoning = /* @__PURE__ */ new Map();
+			/**
+			* Read the last advertised reasoning metadata, including unavailable models.
+			* @param selection - provider and model whose effort is displayed.
+			* @returns reasoning metadata observed during this Host generation.
+			*/
+			reasoningFor(selection) {
+				return this.reasoning.get(JSON.stringify([selection.provider, selection.model]));
+			}
 			generation = 0;
 			inflight;
 			/**
@@ -44,11 +750,14 @@ window.__ModuleLoader__.load({
 				});
 				const operation = this.ctx.remote.session.modelCatalog().then((response) => {
 					if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
-					if (generation === this.generation) this.store.set({
-						value: response.value,
-						status: "ready",
-						error: null
-					});
+					if (generation === this.generation) {
+						for (const group of response.value.groups) for (const model of group.models) this.reasoning.set(JSON.stringify([group.id, model.id]), model.reasoning);
+						this.store.set({
+							value: response.value,
+							status: "ready",
+							error: null
+						});
+					}
 					return response.value;
 				}).catch((error) => {
 					if (generation === this.generation) this.store.update((draft) => {
@@ -83,6 +792,7 @@ window.__ModuleLoader__.load({
 			}
 			/** Clear Host-specific values and load the replacement Host generation. */
 			resetGeneration() {
+				this.reasoning.clear();
 				this.invalidate(true);
 				this.load().catch(() => {});
 			}
@@ -96,6 +806,8 @@ window.__ModuleLoader__.load({
 			available;
 			catalog;
 			projected;
+			isBlank;
+			track;
 			/** The shared snapshot both entries render from (uSES-safe store). */
 			store = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)({
 				current: null,
@@ -103,12 +815,12 @@ window.__ModuleLoader__.load({
 				groups: [],
 				failures: [],
 				status: "idle",
+				pending: null,
 				error: null
 			});
 			/** Latest selection operation wins; an older response never overwrites a newer one. */
 			generation = 0;
 			disposed = false;
-			resolved = false;
 			unsubscribeCatalog;
 			unsubscribeSelection;
 			/**
@@ -117,13 +829,17 @@ window.__ModuleLoader__.load({
 			* @param available - whether this session may use Agent-bound model RPCs.
 			* @param catalog - Host-generation catalog shared by every Session.
 			* @param projected - durable model selection projected from Session history.
+			* @param isBlank - whether this Session has no first message yet.
+			* @param track - desktop-only callback after a successful user selection.
 			*/
-			constructor(sessions, sessionId, available, catalog, projected) {
+			constructor(sessions, sessionId, available, catalog, projected, isBlank, track) {
 				this.sessions = sessions;
 				this.sessionId = sessionId;
 				this.available = available;
 				this.catalog = catalog;
 				this.projected = projected;
+				this.isBlank = isBlank;
+				this.track = track;
 				this.unsubscribeCatalog = catalog.store.subscribe(() => {
 					this.syncInputs();
 				});
@@ -133,7 +849,7 @@ window.__ModuleLoader__.load({
 				this.syncInputs();
 			}
 			/**
-			* Ensure the Host generation's shared advisory catalog is loaded.
+			* Ensure the Host generation's shared available catalog is loaded.
 			* @returns the fresh directory value.
 			*/
 			async load() {
@@ -145,14 +861,19 @@ window.__ModuleLoader__.load({
 			/**
 			* Select the complete provider/model/reasoning selection. The durable
 			* projection frame updates the shared current; failures surface on the store
-			* and throw so each entry's own retry surface engages.
+			* and return with the operation so each entry can present its own failure.
 			* @param selection - provider, provider-owned model id, and optional adapter-owned effort.
+			* @returns the selection outcome, including the original Remote failure.
 			*/
 			async select(selection) {
 				this.assertAvailable();
+				const previous = this.store.getSnapshot().current;
+				const previousEffort = previous?.reasoningEffort ?? (previous === null ? void 0 : this.catalog.reasoningFor(previous)?.defaultEffort);
+				const nextEffort = selection.reasoningEffort ?? this.catalog.reasoningFor(selection)?.defaultEffort;
 				const generation = ++this.generation;
 				this.store.update((s) => {
 					s.status = "selecting";
+					s.pending = selection;
 					s.error = null;
 				});
 				const result = await this.sessions.selectModel({
@@ -161,22 +882,43 @@ window.__ModuleLoader__.load({
 					model: selection.model,
 					...selection.reasoningEffort === void 0 ? {} : { reasoningEffort: selection.reasoningEffort }
 				});
-				if (this.disposed || generation !== this.generation) {
-					if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
-					return;
-				}
+				if (this.disposed || generation !== this.generation) return result.ok ? {
+					ok: true,
+					value: void 0
+				} : result;
 				if (!result.ok) {
 					this.store.update((s) => {
 						s.status = "error";
+						s.pending = null;
 						s.error = `${result.error.code}: ${result.error.message}`;
 					});
-					throw new Error(`session.selectModel failed: ${result.error.code}: ${result.error.message}`);
+					return result;
+				}
+				if (previous !== null) {
+					const from = `${previous.provider}/${previous.model}`;
+					const to = `${selection.provider}/${selection.model}`;
+					if (from !== to) this.track?.("model_switch", {
+						...this.isBlank() ? {} : { session_id: this.sessionId },
+						switch_from: from,
+						switch_to: to
+					});
+					if (from === to && previousEffort !== nextEffort) this.track?.("thinking_level_switch", {
+						...this.isBlank() ? {} : { session_id: this.sessionId },
+						model_name: to,
+						switch_from: previousEffort ?? "default",
+						switch_to: nextEffort ?? "default"
+					});
 				}
 				this.store.update((s) => {
 					s.status = "ready";
+					s.pending = null;
 					s.error = null;
 				});
 				this.syncInputs();
+				return {
+					ok: true,
+					value: void 0
+				};
 			}
 			/**
 			* Invalidate an in-flight selection response from the previous Host generation.
@@ -186,6 +928,7 @@ window.__ModuleLoader__.load({
 				++this.generation;
 				this.store.update((state) => {
 					if (state.status === "selecting") state.status = "idle";
+					state.pending = null;
 					state.error = null;
 				});
 				this.syncInputs();
@@ -203,32 +946,33 @@ window.__ModuleLoader__.load({
 				if (this.disposed) return;
 				const catalog = this.catalog.store.getSnapshot();
 				const projected = modelSelectionProjection(this.projected.getSnapshot());
+				const intended = projected?.next ?? catalog.value?.default;
+				const reasoning = intended === void 0 ? void 0 : this.catalog.reasoningFor(intended);
+				const effort = intended?.reasoningEffort ?? reasoning?.defaultEffort;
+				const retainedEffort = effort === void 0 ? void 0 : reasoning?.efforts.find((level) => level.id === effort)?.name ?? effort;
 				if (catalog.status !== "ready" || catalog.value === null || projected === void 0) {
-					if (this.resolved) {
-						if (catalog.status === "error") this.store.update((state) => {
-							state.status = "error";
-							state.error = catalog.error;
-						});
-						return;
-					}
 					this.store.set({
-						current: null,
+						current: catalog.value === null ? null : this.store.getSnapshot().current,
+						...retainedEffort === void 0 ? {} : { retainedEffort },
 						routable: null,
-						groups: [],
-						failures: [],
+						groups: catalog.value?.groups ?? [],
+						failures: catalog.value?.failures ?? [],
 						status: catalog.status === "error" ? "error" : "loading",
+						pending: this.store.getSnapshot().pending,
 						error: catalog.error
 					});
 					return;
 				}
-				const current = projected.next ?? catalog.value.default;
-				this.resolved = true;
+				const selection = projected.next ?? catalog.value.default;
+				const routable = catalog.value.groups.some((group) => group.id === selection.provider && group.models.some((model) => model.id === selection.model));
 				this.store.set({
-					current,
-					routable: catalog.value.routableProviders.includes(current.provider),
+					current: selection,
+					...retainedEffort === void 0 ? {} : { retainedEffort },
+					routable,
 					groups: catalog.value.groups,
 					failures: catalog.value.failures,
 					status: this.store.getSnapshot().status === "selecting" ? "selecting" : "ready",
+					pending: this.store.getSnapshot().pending,
 					error: null
 				});
 			}
@@ -238,20 +982,6 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region src/client/service.ts
-		/**
-		* ModelDirectoryResolver (`ctx.modelDirectories`): the root owner of per-session
-		* {@link ModelDirectory} instances. Both selection entries (the /model popup
-		* and the composer model seat) resolve their session's directory through
-		* this service, which is what makes the dual entry one shared state.
-		*
-		* Per-session storage follows the client service pattern (InputTriggerService /
-		* CommandUiRuntime): a lazy service-internal map whose entry is deleted by the
-		* owning scope's disposer. The host `dsh-scope` ScopedLayers registry does
-		* does not belong here: it derives scope from the host carrier mechanism
-		* (object-keyed), while client scopes tag contexts with branded SessionId
-		* strings, and it models global+shadow named registries — this is a
-		* per-session singleton with no global layer to merge.
-		*/
 		/** The `ctx.modelDirectories` session model-selection service. */
 		var ModelDirectoryResolver = class extends _deepseek_ai_cordis.Service {
 			static inject = [
@@ -259,27 +989,26 @@ window.__ModuleLoader__.load({
 				"remote",
 				"remote.session"
 			];
-			live = { directories: /* @__PURE__ */ new Map() };
+			live = { directories: new WeakMapWithValues() };
 			catalog;
-			/** Localized composer-block copy; this plugin owns the string it raises. */
-			blockReason;
 			/**
 			* @param ctx - owning root context (the service registers itself as `models`).
-			* @param config - the bound translator for this plugin's own dictionary.
 			*/
-			constructor(ctx, config) {
+			constructor(ctx) {
 				super(ctx, "modelDirectories");
-				this.blockReason = config.blockReason;
 				this.catalog = new ModelCatalogDirectory(ctx);
 				this.catalog.load().catch(() => {});
 				ctx.on("connection/reset", () => {
 					this.catalog.resetGeneration();
-					for (const directory of this.live.directories.values()) directory.resetConnected();
+					for (const directory of this.live.directories.values) directory.resetConnected();
 				});
 				ctx.remote.$on("llm/adapters-updated", () => {
 					this.catalog.refresh();
 				});
 				ctx.remote.$on("settings/document-updated", () => {
+					this.catalog.refresh();
+				});
+				ctx.remote.$on("credentials/record-updated", () => {
 					this.catalog.refresh();
 				});
 				ctx.remote.$on("credentials/reference-updated", () => {
@@ -294,38 +1023,24 @@ window.__ModuleLoader__.load({
 			*/
 			directoryFor(sessionId) {
 				const { live } = this;
-				const existing = live.directories.get(sessionId);
-				if (existing !== void 0) return existing;
 				const sessions = this.ctx.sessions;
 				const actx = sessions.scope(sessionId);
 				if (actx === void 0) throw new Error(`ui-model-selection: session "${String(sessionId)}" resolved no scope`);
 				const binding = sessions.binding(sessionId);
 				if (binding === void 0) throw new Error(`ui-model-selection: session "${String(sessionId)}" resolved no binding`);
-				const directory = new ModelDirectory(this.ctx.remote.session, sessionId, () => sessions.subagentAddress(sessionId) === void 0, this.catalog, binding.session.projections.faceOf("modelSelection"));
-				live.directories.set(sessionId, directory);
-				const conversation = this.ctx.get("conversation");
-				if (conversation !== void 0) {
-					const publish = () => {
-						conversation.blocks.set(sessionId, directory.store.getSnapshot().routable === false ? { reason: this.blockReason() } : void 0);
-					};
-					publish();
-					actx.effect(() => {
-						const stop = directory.store.subscribe(publish);
-						return () => {
-							stop();
-							conversation.blocks.set(sessionId, void 0);
-						};
-					}, "ui-model-selection: composer block");
-				}
+				const existing = live.directories.get(binding);
+				if (existing !== void 0) return existing;
+				const directory = new ModelDirectory(this.ctx.remote.session, sessionId, () => sessions.subagentAddress(sessionId) === void 0, this.catalog, binding.session.projections.faceOf("modelSelection"), () => binding.session.getSnapshot().blank, (name, attributes) => this.ctx.get("productAnalytics")?.track(name, attributes));
+				live.directories.set(binding, directory);
 				actx.effect(() => () => {
 					directory.dispose();
-					live.directories.delete(sessionId);
+					live.directories.delete(binding);
 				}, "ui-model-selection: session directory");
 				return directory;
 			}
 		};
 		//#endregion
-		//#region ../../../../omchor-harness/node_modules/.pnpm/clsx@2.1.1/node_modules/clsx/dist/clsx.mjs
+		//#region ../../../../../deepseek-harness-latest/node_modules/.pnpm/clsx@2.1.1/node_modules/clsx/dist/clsx.mjs
 		function r(e) {
 			var t, f, n = "";
 			if ("string" == typeof e || "number" == typeof e) n += e;
@@ -340,7 +1055,7 @@ window.__ModuleLoader__.load({
 			return n;
 		}
 		//#endregion
-		const css = ".BmS5FW_root{min-width:0;position:relative}.BmS5FW_trigger{min-width:0;max-width:min(360px,45cqw);height:28px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;border-radius:24px;outline:none;align-items:center;gap:4px;padding:0 4px 0 8px;font-size:13px;font-weight:500;line-height:20px;display:flex}.BmS5FW_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.BmS5FW_trigger:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3)}.BmS5FW_trigger:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}.BmS5FW_triggerLabel{text-overflow:ellipsis;white-space:nowrap;min-width:0;overflow:hidden}.BmS5FW_triggerEffort{text-overflow:ellipsis;white-space:nowrap;min-width:0;color:var(--dsw-alias-label-caption);flex-shrink:1000;overflow:hidden}.BmS5FW_triggerIcon{flex:none;display:none}@container (width<=360px){.BmS5FW_triggerIcon{display:block}.BmS5FW_triggerLabel,.BmS5FW_triggerEffort{display:none}}.BmS5FW_chevron{color:var(--dsw-alias-label-caption);flex:none;transition:transform .12s}.BmS5FW_chevronOpen{transform:rotate(180deg)}.BmS5FW_menu{z-index:1100;background:var(--dsw-specific-menu);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);width:max-content;min-width:min(240px,100vw - 32px);max-width:min(420px,100vw - 32px);max-height:min(360px,100vh - 96px);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-primary);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border:0;border-radius:20px;flex-direction:column;padding:4px;display:flex;position:fixed;overflow:hidden}.BmS5FW_status,.BmS5FW_empty{color:var(--dsw-alias-label-tertiary);padding:10px;font-size:13px;line-height:20px}.BmS5FW_error,.BmS5FW_warning{background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);border-radius:8px;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px;padding:7px 8px;font-size:12px;line-height:18px;display:flex}.BmS5FW_warning{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-state-warn-label)}.BmS5FW_retry{color:inherit;font:inherit;cursor:pointer;background:0 0;border:none;flex:none;padding:0;font-weight:600}.BmS5FW_search{flex:none;width:100%;margin-bottom:4px}.BmS5FW_menuItems{flex-direction:column;flex:auto;min-height:0;display:flex}.BmS5FW_groups{min-height:0;overflow-y:auto}.BmS5FW_group+.BmS5FW_group{margin-top:4px}.BmS5FW_groupTitle{z-index:1;background:var(--dsw-specific-menu);color:var(--dsw-alias-label-tertiary);padding:5px 8px 3px;font-size:12px;font-weight:500;line-height:18px;position:sticky;top:0}.BmS5FW_option{box-sizing:border-box;width:auto;min-width:100%;min-height:38px;color:inherit;text-align:left;cursor:pointer;background:0 0;border:none;border-radius:10px;outline:none;align-items:center;gap:8px;padding:6px 8px;display:flex}.BmS5FW_option:hover:not(:disabled),.BmS5FW_option:focus-visible{background:var(--dsw-alias-interactive-bg-hover)}.BmS5FW_selected{background:0 0}.BmS5FW_option:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}.BmS5FW_optionCopy{flex-direction:column;flex:1;min-width:0;display:flex}.BmS5FW_modelName{color:inherit;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500;line-height:20px;overflow:hidden}.BmS5FW_check{color:var(--dsw-alias-label-primary);flex:0 0 18px;place-items:center;display:grid}.BmS5FW_cell{box-sizing:border-box;width:auto;min-width:100%;height:40px;color:var(--dsw-alias-label-primary);cursor:pointer;text-align:left;background:0 0;border:none;border-radius:10px;align-items:center;gap:8px;padding:0 10px;font-size:14px;line-height:22px;display:flex}.BmS5FW_cell:hover{background:var(--dsw-alias-interactive-bg-hover)}.BmS5FW_cellLabel{white-space:nowrap;flex:none}.BmS5FW_cellValue{text-overflow:ellipsis;white-space:nowrap;text-align:right;min-width:0;color:var(--dsw-alias-label-tertiary);flex:auto;overflow:hidden}.BmS5FW_cellChevron{color:var(--dsw-alias-label-tertiary);flex:none}";
+		const css = ".FwGX5a_root{min-width:0;position:relative}.FwGX5a_trigger{border-radius:var(--dsw-radius-sm);min-width:0;max-width:min(360px,45cqw);height:28px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;outline:none;align-items:center;gap:4px;padding:0 4px 0 8px;font-size:13px;font-weight:400;line-height:20px;display:flex}.FwGX5a_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.FwGX5a_trigger:focus-visible:not([data-selection-focus]){box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary))}.FwGX5a_trigger:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}.FwGX5a_triggerLabel{text-overflow:ellipsis;white-space:nowrap;min-width:0;overflow:hidden}.FwGX5a_triggerEffort{text-overflow:ellipsis;white-space:nowrap;min-width:0;color:var(--dsw-alias-label-caption);flex-shrink:1000;overflow:hidden}.FwGX5a_triggerIcon{display:var(--dsh-composer-model-icon-display,none);flex:none}.FwGX5a_triggerLabel,.FwGX5a_triggerEffort{display:var(--dsh-composer-model-text-display,block)}.FwGX5a_chevron{color:var(--dsw-alias-label-caption);flex:none;transition:transform .12s}.FwGX5a_chevronOpen{transform:rotate(180deg)}.FwGX5a_menu{z-index:1100;--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);width:max-content;min-width:min(240px,100vw - 32px);max-width:min(420px,100vw - 32px);max-height:min(360px,100vh - 96px);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-primary);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border:0;flex-direction:column;padding:4px;display:flex;position:fixed;overflow:hidden}.FwGX5a_status,.FwGX5a_empty{color:var(--dsw-alias-label-tertiary);padding:8px;font-size:12px;line-height:18px}.FwGX5a_error,.FwGX5a_warning{border-radius:var(--dsw-radius-md);background:var(--dsw-alias-interactive-bg-hover-danger);color:var(--dsw-alias-state-error-primary);justify-content:space-between;align-items:flex-start;gap:6px;margin-bottom:3px;padding:6px 7px;font-size:11px;line-height:16px;display:flex}.FwGX5a_warning{background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-state-warn-label)}.FwGX5a_retry{color:inherit;font:inherit;cursor:pointer;background:0 0;border:none;flex:none;padding:0;font-weight:600}.FwGX5a_searchRow{flex-shrink:0;margin:2px 0 3px;position:relative}.FwGX5a_searchRow .FwGX5a_search{border-radius:var(--dsw-radius-md);background:0 0;border:0 solid #0000;height:auto;padding:5px 7px;display:flex}.FwGX5a_searchRow .FwGX5a_searchWithQuery{padding-right:34px}.FwGX5a_searchClear{corner-shape:round;width:24px;height:24px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;border-radius:50%;justify-content:center;align-items:center;padding:0;display:inline-flex;position:absolute;top:50%;right:4px;transform:translateY(-50%)}.FwGX5a_searchClear:hover,.FwGX5a_searchClear:focus-visible{background:var(--dsw-alias-interactive-bg-hover);outline:none}.FwGX5a_searchRow .FwGX5a_search:focus-within{border-color:#0000}.FwGX5a_searchRow .FwGX5a_search input{padding:0;font-size:12px;line-height:normal}.FwGX5a_searchRow .FwGX5a_search input::placeholder{color:var(--dsw-alias-label-caption)}.FwGX5a_groups{min-height:0;overflow-y:auto}.FwGX5a_option{box-sizing:border-box;border-radius:var(--dsw-radius-md);width:auto;min-width:100%;min-height:34px;color:inherit;text-align:left;cursor:pointer;background:0 0;border:none;outline:none;align-items:center;gap:6px;padding:5px 7px;display:flex}.FwGX5a_option:not(.FwGX5a_modelOption):hover:not(:disabled),.FwGX5a_option:focus-visible,.FwGX5a_optionActive:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}.FwGX5a_selected{background:0 0}.FwGX5a_option:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}.FwGX5a_optionCopy{flex-direction:column;flex:1;min-width:0;display:flex}.FwGX5a_modelName{color:inherit;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:400;line-height:18px;overflow:hidden}.FwGX5a_check{color:var(--dsw-alias-label-primary);flex:0 0 14px;place-items:center;display:grid}.FwGX5a_check svg{width:14px;height:14px}.FwGX5a_cell{box-sizing:border-box;border-radius:var(--dsw-radius-md);width:auto;min-width:100%;height:34px;color:var(--dsw-alias-label-primary);cursor:pointer;text-align:left;background:0 0;border:none;outline:none;align-items:center;gap:6px;padding:0 8px;font-size:13px;line-height:20px;display:flex}.FwGX5a_cell:hover,.FwGX5a_cell:focus-visible{background:var(--dsw-alias-interactive-bg-hover)}.FwGX5a_cellLabel{white-space:nowrap;flex:none}.FwGX5a_cellValue{text-overflow:ellipsis;white-space:nowrap;text-align:right;min-width:0;color:var(--dsw-alias-label-tertiary);flex:auto;overflow:hidden}.FwGX5a_cellChevron{width:12px;height:12px;color:var(--dsw-alias-menu-icon);flex:none}";
 		const tagId = "@deepseek-ai/dsh-client-ui-model-selection/ModelSelect.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId) + "]") === null) {
 			const tag = document.createElement("style");
@@ -350,34 +1065,47 @@ window.__ModuleLoader__.load({
 			document.head.appendChild(tag);
 		}
 		var ModelSelect_module_css_default = {
-			"cell": "BmS5FW_cell",
-			"cellChevron": "BmS5FW_cellChevron",
-			"cellLabel": "BmS5FW_cellLabel",
-			"cellValue": "BmS5FW_cellValue",
-			"check": "BmS5FW_check",
-			"chevron": "BmS5FW_chevron",
-			"chevronOpen": "BmS5FW_chevronOpen",
-			"empty": "BmS5FW_empty",
-			"error": "BmS5FW_error",
-			"group": "BmS5FW_group",
-			"groupTitle": "BmS5FW_groupTitle",
-			"groups": "BmS5FW_groups",
-			"menu": "BmS5FW_menu",
-			"menuItems": "BmS5FW_menuItems",
-			"modelName": "BmS5FW_modelName",
-			"option": "BmS5FW_option",
-			"optionCopy": "BmS5FW_optionCopy",
-			"retry": "BmS5FW_retry",
-			"root": "BmS5FW_root",
-			"search": "BmS5FW_search",
-			"selected": "BmS5FW_selected",
-			"status": "BmS5FW_status",
-			"trigger": "BmS5FW_trigger",
-			"triggerEffort": "BmS5FW_triggerEffort",
-			"triggerIcon": "BmS5FW_triggerIcon",
-			"triggerLabel": "BmS5FW_triggerLabel",
-			"warning": "BmS5FW_warning"
+			"cell": "FwGX5a_cell",
+			"cellChevron": "FwGX5a_cellChevron",
+			"cellLabel": "FwGX5a_cellLabel",
+			"cellValue": "FwGX5a_cellValue",
+			"check": "FwGX5a_check",
+			"chevron": "FwGX5a_chevron",
+			"chevronOpen": "FwGX5a_chevronOpen",
+			"empty": "FwGX5a_empty",
+			"error": "FwGX5a_error",
+			"groups": "FwGX5a_groups",
+			"menu": "FwGX5a_menu",
+			"modelName": "FwGX5a_modelName",
+			"modelOption": "FwGX5a_modelOption",
+			"option": "FwGX5a_option",
+			"optionActive": "FwGX5a_optionActive",
+			"optionCopy": "FwGX5a_optionCopy",
+			"retry": "FwGX5a_retry",
+			"root": "FwGX5a_root",
+			"search": "FwGX5a_search",
+			"searchClear": "FwGX5a_searchClear",
+			"searchRow": "FwGX5a_searchRow",
+			"searchWithQuery": "FwGX5a_searchWithQuery",
+			"selected": "FwGX5a_selected",
+			"status": "FwGX5a_status",
+			"trigger": "FwGX5a_trigger",
+			"triggerEffort": "FwGX5a_triggerEffort",
+			"triggerIcon": "FwGX5a_triggerIcon",
+			"triggerLabel": "FwGX5a_triggerLabel",
+			"warning": "FwGX5a_warning"
 		};
+		//#endregion
+		//#region src/client/provider-order.ts
+		/** Shared provider display order for the composer and command model pickers. */
+		/**
+		* Put the account and official providers first, preserving every other relative order.
+		* @param groups - Provider groups in catalog order.
+		* @returns a sorted copy; model order within each group is unchanged.
+		*/
+		function orderModelProviders(groups) {
+			return groups.toSorted((left, right) => (left.id === "deepseek-account" ? 0 : left.id === "deepseek-official" ? 1 : 2) - (right.id === "deepseek-account" ? 0 : right.id === "deepseek-official" ? 1 : 2));
+		}
 		//#endregion
 		//#region src/client/ModelSelect.tsx
 		/**
@@ -387,15 +1115,25 @@ window.__ModuleLoader__.load({
 		* each drilling into its own list — the provider-grouped model list over
 		* the shared directory, and the effort levels. The trigger (313:14108's
 		* ToggleButton) shows both: model name + effort in the caption tone.
-		* The model list carries a search field that narrows the loaded groups
-		* locally (never refetching); it sits in the card but OUTSIDE the `menu`
-		* role's element, so the menu keeps only menu content while the field stays
-		* a labeled textbox.
-		* Data and submission ride the SAME per-session ModelDirectory as the
-		* /model popup; exact-model reasoning metadata and the selected effort come
-		* from the Host rather than a client-owned vocabulary. A rejected selection
-		* announces through the shared transient Toast anchored to the composer
-		* card; the in-menu strip with Retry remains the catalog-load surface.
+		* Model catalogs above four entries show search, which retains focus while
+		* ↑/↓ cycle the highlighted result; Enter and Tab accept it. Smaller model
+		* catalogs, root panes, and effort panes move focus between rows. Escape and Shift+Tab leave a drilled pane first and otherwise close
+		* back to the trigger. A drilled pane focuses the current effort or model
+		* search field. Provider headings paint their background only while pinned
+		* by scrolling. Clearing a query restores the full list and search focus.
+		* Selecting restores trigger focus without a ring until the trigger loses focus
+		* or the menu reopens. Model names match a case-insensitive ordered subsequence
+		* within each provider group, ranked by
+		* prefix, alignment score, then catalog order. Returning to the root pane
+		* hands focus back to the cell that opened it. Data and submission ride the
+		* same per-session ModelDirectory as the /model popup; exact-model reasoning
+		* metadata and the selected effort come from the Host rather than a
+		* client-owned vocabulary. A rejected selection announces through the shared
+		* transient Toast anchored to the composer card; the in-menu strip with
+		* Retry remains the catalog-load surface. While the directory's pending
+		* selection is unsettled, the trigger shows a spinner in place of its
+		* chevron, and each row whose value that selection carries shows one in place
+		* of its check mark.
 		*/
 		/** Unplaced portal card: hidden but laid out at a fixed origin so offsetWidth/offsetHeight are real (Menu primitive's measure pass). */
 		const MEASURE_STYLE = {
@@ -403,34 +1141,6 @@ window.__ModuleLoader__.load({
 			left: 0,
 			top: 0
 		};
-		/**
-		* Narrow the loaded provider groups to a search query, preserving group order
-		* and each surviving group's model order. The query is matched
-		* case-insensitively as a substring of a model's display name or id; a query
-		* that matches the provider's own name keeps that provider's complete list,
-		* so a group header never contradicts the rows beneath it. A blank query
-		* returns the loaded groups unchanged, which is what clearing restores.
-		* @param groups - the directory's loaded groups.
-		* @param query - the search field's current text.
-		* @returns the groups to render: each matches by name, or carries at least one matching row.
-		*/
-		function filterGroups(groups, query) {
-			const needle = query.trim().toLowerCase();
-			if (needle === "") return groups;
-			const visible = [];
-			for (const group of groups) {
-				if (group.name.toLowerCase().includes(needle)) {
-					visible.push(group);
-					continue;
-				}
-				const models = group.models.filter((model) => model.name.toLowerCase().includes(needle) || model.id.toLowerCase().includes(needle));
-				if (models.length > 0) visible.push({
-					...group,
-					models
-				});
-			}
-			return visible;
-		}
 		/**
 		* Render the composer model seat.
 		* @param props - owner share (locked) + injected face (shared directory
@@ -442,16 +1152,21 @@ window.__ModuleLoader__.load({
 			const [open, setOpen] = (0, react.useState)(false);
 			const [pane, setPane] = (0, react.useState)("root");
 			const [query, setQuery] = (0, react.useState)("");
+			const [highlightedIndex, setHighlightedIndex] = (0, react.useState)(null);
+			const [selectionFocus, setSelectionFocus] = (0, react.useState)(false);
 			const lastActionRef = (0, react.useRef)("load");
 			const [toast, setToast] = (0, react.useState)(null);
 			const toastSeq = (0, react.useRef)(0);
 			const rootRef = (0, react.useRef)(null);
 			const triggerRef = (0, react.useRef)(null);
+			const searchRef = (0, react.useRef)(null);
 			const menuRef = (0, react.useRef)(null);
+			const groupsRef = (0, react.useRef)(null);
 			const [menuPos, setMenuPos] = (0, react.useState)(null);
 			const itemRefs = (0, react.useRef)([]);
 			const id = (0, react.useId)();
-			const choices = (0, react.useMemo)(() => state.groups.flatMap((group) => group.models.map((model) => ({
+			const groups = (0, react.useMemo)(() => orderModelProviders(state.groups), [state.groups]);
+			const choices = (0, react.useMemo)(() => groups.flatMap((group) => group.models.map((model) => ({
 				group,
 				model,
 				selection: {
@@ -459,12 +1174,26 @@ window.__ModuleLoader__.load({
 					model: model.id,
 					...model.reasoning?.defaultEffort === void 0 ? {} : { reasoningEffort: model.reasoning.defaultEffort }
 				}
-			}))), [state.groups]);
-			const visibleGroups = (0, react.useMemo)(() => filterGroups(state.groups, query), [state.groups, query]);
+			}))), [groups]);
+			const showSearch = choices.length > 4;
+			const filteredGroups = (0, react.useMemo)(() => groups.map((group) => ({
+				...group,
+				models: (0, _deepseek_ai_dsh_client_ui_primitives.rankByName)(group.models, showSearch ? query.trim() : "")
+			})).filter((group) => group.models.length > 0), [
+				groups,
+				query,
+				showSearch
+			]);
+			const visibleModels = (0, react.useMemo)(() => filteredGroups.flatMap((group) => group.models.map((model) => ({
+				provider: group.id,
+				model: model.id
+			}))), [filteredGroups]);
+			const currentVisibleIndex = visibleModels.findIndex((model) => model.provider === state.current?.provider && model.model === state.current.model);
+			const activeModelIndex = Math.min(highlightedIndex ?? Math.max(0, currentVisibleIndex), visibleModels.length - 1);
 			const currentChoice = choices[state.current === null ? -1 : choices.findIndex((c) => c.selection.provider === state.current?.provider && c.selection.model === state.current.model)];
 			const reasoning = currentChoice?.model.reasoning;
 			const effectiveEffort = state.current?.reasoningEffort ?? reasoning?.defaultEffort;
-			const effortLabel = reasoning === void 0 ? void 0 : effectiveEffort === void 0 ? t("effort.providerDefault") : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name ?? effectiveEffort;
+			const effortLabel = reasoning === void 0 ? state.retainedEffort : effectiveEffort === void 0 ? t("effort.providerDefault") : reasoning.efforts.find((level) => level.id === effectiveEffort)?.name ?? effectiveEffort;
 			const effortChoices = (0, react.useMemo)(() => reasoning === void 0 ? [] : [...reasoning.defaultEffort === void 0 ? [{
 				key: "provider-default",
 				effort: void 0,
@@ -474,7 +1203,8 @@ window.__ModuleLoader__.load({
 				effort: effort.id,
 				label: effort.name
 			}))], [reasoning, t]);
-			const busy = state.status === "selecting";
+			const { pending } = state;
+			const busy = pending !== null;
 			const reload = () => {
 				lastActionRef.current = "load";
 				load();
@@ -491,6 +1221,53 @@ window.__ModuleLoader__.load({
 					document.removeEventListener("mousedown", closeOutside);
 				};
 			}, [open]);
+			(0, react.useLayoutEffect)(() => {
+				if (!showSearch) {
+					setQuery("");
+					setHighlightedIndex(null);
+				}
+			}, [showSearch]);
+			const paneFocus = (0, react.useRef)(null);
+			const previousShowSearch = (0, react.useRef)(showSearch);
+			(0, react.useEffect)(() => {
+				const changedSearchMode = previousShowSearch.current !== showSearch;
+				previousShowSearch.current = showSearch;
+				const intent = paneFocus.current ?? (changedSearchMode && pane === "model" ? "drill" : null);
+				paneFocus.current = null;
+				if (!open || intent === null) return;
+				if (intent === "drill") {
+					if (pane === "model" && showSearch) {
+						searchRef.current?.focus();
+						return;
+					}
+					(menuRef.current?.querySelector("[role=\"menuitemradio\"][aria-checked=\"true\"]:not([disabled])") ?? itemRefs.current.find((item) => item !== null && !item.disabled) ?? triggerRef.current)?.focus();
+					return;
+				}
+				const cell = itemRefs.current[intent === "effort" ? 1 : 0];
+				(cell !== null && cell !== void 0 && !cell.disabled ? cell : triggerRef.current)?.focus();
+			}, [
+				open,
+				pane,
+				showSearch
+			]);
+			(0, react.useEffect)(() => {
+				const viewport = groupsRef.current;
+				if (viewport === null) return;
+				return (0, _deepseek_ai_dsh_client_ui_primitives.observeStickyMenuGroups)(viewport);
+			}, [
+				available,
+				open,
+				pane,
+				filteredGroups
+			]);
+			(0, react.useLayoutEffect)(() => {
+				if (open && pane === "model" && activeModelIndex >= 0) itemRefs.current[activeModelIndex]?.scrollIntoView({ block: "nearest" });
+			}, [
+				open,
+				pane,
+				activeModelIndex,
+				visibleModels
+			]);
 			(0, react.useLayoutEffect)(() => {
 				if (!open) {
 					setMenuPos(null);
@@ -522,14 +1299,23 @@ window.__ModuleLoader__.load({
 			}, [
 				open,
 				pane,
-				state
+				state,
+				query
 			]);
 			if (!available) return null;
 			const show = () => {
-				setPane("root");
+				setSelectionFocus(false);
+				triggerRef.current?.focus();
 				setQuery("");
+				setHighlightedIndex(null);
+				if (state.current === null) paneFocus.current = "drill";
+				setPane(state.current === null ? "model" : "root");
 				setOpen(true);
 				reload();
+			};
+			const changeQuery = (next) => {
+				setQuery(next);
+				setHighlightedIndex(0);
 			};
 			const close = (restoreFocus = false) => {
 				setOpen(false);
@@ -538,35 +1324,77 @@ window.__ModuleLoader__.load({
 					triggerRef.current?.focus();
 				});
 			};
+			const closeAfterSelection = () => {
+				setSelectionFocus(true);
+				close(true);
+			};
+			const drill = (next) => {
+				setQuery("");
+				setHighlightedIndex(null);
+				paneFocus.current = "drill";
+				setPane(next);
+			};
+			/** Leave a drilled pane for the root one, handing the keyboard back to its cell. */
+			const back = (from) => {
+				paneFocus.current = from;
+				setPane("root");
+			};
 			const moveFocus = (offset) => {
 				const items = itemRefs.current.filter((item) => item !== null);
 				if (items.length === 0) return;
 				const active = items.findIndex((item) => item === document.activeElement);
-				items[(Math.max(active, 0) + offset + items.length) % items.length]?.focus();
-			};
-			const focusEdge = (edge) => {
-				const items = itemRefs.current.filter((item) => item !== null);
-				const item = edge === -1 ? items[items.length - 1] : items[edge];
-				if (item !== void 0) item.focus();
+				items[active === -1 ? offset > 0 ? 0 : items.length - 1 : (active + offset + items.length) % items.length]?.focus();
 			};
 			const onRootKeyDown = (event) => {
+				if (event.nativeEvent.isComposing) return;
 				if (event.key === "Escape" && open) {
 					event.preventDefault();
-					if (pane === "model" && query !== "") {
-						setQuery("");
-						return;
-					}
-					if (pane !== "root") setPane("root");
+					if (pane !== "root" && state.current !== null) back(pane);
 					else close(true);
 					return;
 				}
 				if (!open) return;
-				if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+				if (pane === "model" && showSearch && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
 					event.preventDefault();
-					if (event.target instanceof HTMLInputElement) {
-						focusEdge(event.key === "ArrowDown" ? 0 : -1);
+					if (!busy && visibleModels.length > 0) {
+						setHighlightedIndex((activeModelIndex + (event.key === "ArrowDown" ? 1 : -1) + visibleModels.length) % visibleModels.length);
+						searchRef.current?.focus();
+					}
+					return;
+				}
+				if (pane === "model" && showSearch && event.target instanceof HTMLInputElement && (event.key === "Enter" || event.key === "Tab" && !event.shiftKey)) {
+					if (event.key === "Tab" && visibleModels.length === 0) return;
+					event.preventDefault();
+					const highlighted = visibleModels[activeModelIndex];
+					if (!busy && highlighted !== void 0) choose(highlighted);
+					return;
+				}
+				if (event.key === "Tab") {
+					if (event.shiftKey) {
+						event.preventDefault();
+						if (pane !== "root" && state.current !== null) back(pane);
+						else close(true);
 						return;
 					}
+					const focused = document.activeElement;
+					const rows = itemRefs.current.filter((item) => item !== null);
+					if (focused instanceof HTMLButtonElement && rows.includes(focused)) {
+						event.preventDefault();
+						focused.click();
+						return;
+					}
+					if (focused !== triggerRef.current) return;
+					event.preventDefault();
+					if (pane === "model" && showSearch) {
+						setHighlightedIndex(null);
+						searchRef.current?.focus();
+						return;
+					}
+					(menuRef.current?.querySelector("[role=\"menuitemradio\"][aria-checked=\"true\"]:not([disabled])") ?? rows.find((item) => !item.disabled))?.focus();
+					return;
+				}
+				if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+					event.preventDefault();
 					moveFocus(event.key === "ArrowDown" ? 1 : -1);
 				}
 			};
@@ -574,41 +1402,43 @@ window.__ModuleLoader__.load({
 				if (event.relatedTarget instanceof Node && (rootRef.current?.contains(event.relatedTarget) === true || menuRef.current?.contains(event.relatedTarget) === true)) return;
 				close();
 			};
-			const settleSelection = (accepted) => {
-				if (accepted) {
-					if (rootRef.current !== null) close(true);
+			const settleSelection = (result) => {
+				if (result === void 0) return;
+				if (result.ok) {
+					if (rootRef.current !== null) closeAfterSelection();
 					return;
 				}
-				const message = directory.getSnapshot().error;
-				if (message !== null) {
-					toastSeq.current += 1;
-					setToast({
-						seq: toastSeq.current,
-						text: t("error.action", { message })
-					});
-				}
+				const { error } = result;
+				toastSeq.current += 1;
+				setToast({
+					seq: toastSeq.current,
+					text: error.code === "session/writer-held" ? t("error.sessionInUse") : t("error.action", { message: `${error.code}: ${error.message}` })
+				});
+			};
+			const submit = (selection) => {
+				lastActionRef.current = "select";
+				setSelectionFocus(true);
+				triggerRef.current?.focus();
+				select(selection).then(settleSelection);
 			};
 			const choose = (selection) => {
 				if (state.current?.provider === selection.provider && state.current.model === selection.model) {
-					close(true);
+					closeAfterSelection();
 					return;
 				}
-				lastActionRef.current = "select";
-				select(selection).then(settleSelection);
+				submit(selection);
 			};
 			const chooseEffort = (effort) => {
 				if (state.current === null) return;
 				if (effectiveEffort === effort) {
-					close(true);
+					closeAfterSelection();
 					return;
 				}
-				const selection = {
+				submit({
 					provider: state.current.provider,
 					model: state.current.model,
 					...effort === void 0 ? {} : { reasoningEffort: effort }
-				};
-				lastActionRef.current = "select";
-				select(selection).then(settleSelection);
+				});
 			};
 			const waiting = state.current === null && state.status === "loading";
 			const modelLabel = waiting ? t("trigger.loading") : currentChoice?.model.name ?? (state.current === null ? t("trigger.fallback") : `${state.current.provider}/${state.current.model}`);
@@ -619,6 +1449,7 @@ window.__ModuleLoader__.load({
 			});
 			itemRefs.current = [];
 			let itemIndex = 0;
+			let modelIndex = 0;
 			const itemRef = () => {
 				const at = itemIndex++;
 				return (node) => {
@@ -630,6 +1461,9 @@ window.__ModuleLoader__.load({
 				className: ModelSelect_module_css_default.root,
 				onKeyDown: onRootKeyDown,
 				onBlur,
+				onMouseDown: (event) => {
+					if (event.target instanceof Element && event.target.closest("button") !== null) event.preventDefault();
+				},
 				children: [
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 						ref: triggerRef,
@@ -640,13 +1474,18 @@ window.__ModuleLoader__.load({
 						"aria-expanded": open,
 						"aria-controls": open ? `${id}-menu` : void 0,
 						title: triggerLabel,
+						"aria-busy": busy,
+						"data-selection-focus": selectionFocus ? "" : void 0,
+						onBlur: () => {
+							setSelectionFocus(false);
+						},
 						disabled: locked,
 						onClick: () => {
-							if (open) close();
+							if (open) close(true);
 							else show();
 						},
 						children: [
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconDataOutline16, {
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconDataOutlineRegular, {
 								className: ModelSelect_module_css_default.triggerIcon,
 								size: 16
 							}),
@@ -658,186 +1497,206 @@ window.__ModuleLoader__.load({
 								className: ModelSelect_module_css_default.triggerEffort,
 								children: effortLabel
 							}),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutline14, { className: clsx(ModelSelect_module_css_default.chevron, open && ModelSelect_module_css_default.chevronOpen) })
+							busy ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.StateDot, { state: "ongoing" }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutlineRegular, { className: clsx(ModelSelect_module_css_default.chevron, open && ModelSelect_module_css_default.chevronOpen) })
 						]
 					}),
-					open && (0, react_dom.createPortal)(/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					open && (0, react_dom.createPortal)(/* @__PURE__ */ (0, react_jsx_runtime.jsxs)(_deepseek_ai_dsh_client_ui_primitives.MenuSurface, {
 						ref: menuRef,
+						id: `${id}-menu`,
 						className: ModelSelect_module_css_default.menu,
 						style: menuPos ?? MEASURE_STYLE,
-						children: [pane === "model" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Input, {
-							className: ModelSelect_module_css_default.search,
-							type: "search",
-							icon: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconSearchOutline16, { "aria-hidden": "true" }),
-							value: query,
-							placeholder: t("search.placeholder"),
-							"aria-label": t("search.aria"),
-							autoFocus: true,
-							onChange: (event) => {
-								setQuery(event.currentTarget.value);
-							}
-						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-							id: `${id}-menu`,
-							className: ModelSelect_module_css_default.menuItems,
-							role: "menu",
-							"aria-label": t("menu.aria"),
-							"aria-busy": state.status === "loading" || busy,
-							children: [
-								pane === "root" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
-									ref: itemRef(),
-									type: "button",
-									role: "menuitem",
-									className: ModelSelect_module_css_default.cell,
-									onClick: () => {
-										setPane("model");
-									},
-									children: [
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-											className: ModelSelect_module_css_default.cellLabel,
-											children: t("menu.model")
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-											className: ModelSelect_module_css_default.cellValue,
-											children: modelLabel
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutline14, { className: ModelSelect_module_css_default.cellChevron })
-									]
-								}), reasoning !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
-									ref: itemRef(),
-									type: "button",
-									role: "menuitem",
-									className: ModelSelect_module_css_default.cell,
-									onClick: () => {
-										setPane("effort");
-									},
-									children: [
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-											className: ModelSelect_module_css_default.cellLabel,
-											children: t("menu.effort")
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-											className: ModelSelect_module_css_default.cellValue,
-											children: effortLabel
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutline14, { className: ModelSelect_module_css_default.cellChevron })
-									]
-								})] }),
-								pane === "model" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-									state.status === "loading" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: ModelSelect_module_css_default.status,
-										children: t("status.loading")
+						role: pane === "model" ? "group" : "menu",
+						"aria-label": t("menu.aria"),
+						"aria-busy": state.status === "loading" || busy,
+						children: [
+							pane === "root" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+								ref: itemRef(),
+								type: "button",
+								role: "menuitem",
+								className: ModelSelect_module_css_default.cell,
+								onClick: () => {
+									drill("model");
+								},
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: ModelSelect_module_css_default.cellLabel,
+										children: t("menu.model")
 									}),
-									state.error !== null && lastActionRef.current === "load" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-										className: ModelSelect_module_css_default.error,
-										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("error.action", { message: state.error }) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											className: ModelSelect_module_css_default.retry,
-											onClick: reload,
-											children: t("retry")
-										})]
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: ModelSelect_module_css_default.cellValue,
+										children: modelLabel
 									}),
-									state.failures.map((failure) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-										className: ModelSelect_module_css_default.warning,
-										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("warning.groupLoad", {
-											name: failure.name,
-											message: failure.message
-										}) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											className: ModelSelect_module_css_default.retry,
-											onClick: reload,
-											children: t("retry")
-										})]
-									}, failure.id)),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: clsx(ModelSelect_module_css_default.groups, "scrollable"),
-										children: visibleGroups.map((group) => {
-											const headingId = `${id}-${group.id}`;
-											return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
-												role: "group",
-												"aria-labelledby": headingId,
-												className: ModelSelect_module_css_default.group,
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-													className: ModelSelect_module_css_default.groupTitle,
-													id: headingId,
-													children: group.name
-												}), group.models.map((model) => {
-													const selected = state.current?.provider === group.id && state.current.model === model.id;
-													return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
-														ref: itemRef(),
-														type: "button",
-														role: "menuitemradio",
-														"aria-checked": selected,
-														className: clsx(ModelSelect_module_css_default.option, selected && ModelSelect_module_css_default.selected),
-														title: model.name,
-														disabled: busy,
-														onClick: () => {
-															choose({
-																provider: group.id,
-																model: model.id
-															});
-														},
-														children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-															className: ModelSelect_module_css_default.optionCopy,
-															children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-																className: ModelSelect_module_css_default.modelName,
-																children: model.name
-															})
-														}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-															className: ModelSelect_module_css_default.check,
-															children: selected ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16, {}) : null
-														})]
-													}, model.id);
-												})]
-											}, group.id);
-										})
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutlineRegular, { className: ModelSelect_module_css_default.cellChevron })
+								]
+							}), reasoning !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+								ref: itemRef(),
+								type: "button",
+								role: "menuitem",
+								className: ModelSelect_module_css_default.cell,
+								onClick: () => {
+									drill("effort");
+								},
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: ModelSelect_module_css_default.cellLabel,
+										children: t("menu.effort")
 									}),
-									state.status === "ready" && choices.length === 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: ModelSelect_module_css_default.empty,
-										children: t("empty.models")
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: ModelSelect_module_css_default.cellValue,
+										children: effortLabel
 									}),
-									state.status === "ready" && choices.length > 0 && visibleGroups.length === 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: ModelSelect_module_css_default.empty,
-										children: t("search.empty")
-									})
-								] }),
-								pane === "effort" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [state.error !== null && lastActionRef.current === "load" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronRightOutlineRegular, { className: ModelSelect_module_css_default.cellChevron })
+								]
+							})] }),
+							pane === "model" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+								showSearch && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: ModelSelect_module_css_default.searchRow,
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Input, {
+										ref: searchRef,
+										className: clsx(ModelSelect_module_css_default.search, query !== "" && ModelSelect_module_css_default.searchWithQuery),
+										type: "text",
+										role: "searchbox",
+										"aria-label": t("search.placeholder"),
+										"aria-controls": `${id}-models`,
+										"aria-activedescendant": activeModelIndex < 0 ? void 0 : `${id}-model-${activeModelIndex}`,
+										placeholder: t("search.placeholder"),
+										value: query,
+										readOnly: busy,
+										onChange: (event) => {
+											changeQuery(event.target.value);
+										}
+									}), query !== "" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: ModelSelect_module_css_default.searchClear,
+										"aria-label": t("search.clear"),
+										disabled: busy,
+										onClick: () => {
+											changeQuery("");
+											searchRef.current?.focus();
+										},
+										children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCloseFillRegular, {})
+									})]
+								}),
+								state.status === "loading" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: ModelSelect_module_css_default.status,
+									children: t("status.loading")
+								}),
+								state.error !== null && lastActionRef.current === "load" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									className: ModelSelect_module_css_default.error,
 									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("error.action", { message: state.error }) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 										type: "button",
 										className: ModelSelect_module_css_default.retry,
 										onClick: reload,
-										children: t("action.reload")
+										children: t("retry")
 									})]
-								}), effortChoices.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								}),
+								state.failures.map((failure) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: ModelSelect_module_css_default.warning,
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("warning.groupLoad", {
+										name: failure.id === "deepseek-account" ? t("provider.account") : failure.name,
+										message: failure.message
+									}) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: ModelSelect_module_css_default.retry,
+										onClick: reload,
+										children: t("retry")
+									})]
+								}, failure.id)),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									ref: groupsRef,
+									id: `${id}-models`,
+									className: clsx(ModelSelect_module_css_default.groups, "scrollable"),
+									role: "menu",
+									"aria-label": t("menu.model"),
+									hidden: filteredGroups.length === 0,
+									children: filteredGroups.map((group) => {
+										return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.MenuGroup, {
+											label: group.id === "deepseek-account" ? t("provider.account") : group.name,
+											children: group.models.map((model) => {
+												const index = modelIndex++;
+												const selected = state.current?.provider === group.id && state.current.model === model.id;
+												return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+													ref: itemRef(),
+													type: "button",
+													role: "menuitemradio",
+													"aria-checked": selected,
+													id: `${id}-model-${index}`,
+													tabIndex: showSearch ? -1 : 0,
+													onFocus: () => {
+														setHighlightedIndex(index);
+													},
+													"data-highlighted": index === activeModelIndex ? "" : void 0,
+													className: clsx(ModelSelect_module_css_default.option, ModelSelect_module_css_default.modelOption, selected && ModelSelect_module_css_default.selected, index === activeModelIndex && ModelSelect_module_css_default.optionActive),
+													onMouseMove: busy || index === activeModelIndex ? void 0 : () => {
+														if (showSearch) setHighlightedIndex(index);
+														else itemRefs.current[index]?.focus();
+													},
+													title: model.name,
+													disabled: busy,
+													onClick: () => {
+														choose({
+															provider: group.id,
+															model: model.id
+														});
+													},
+													children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: ModelSelect_module_css_default.optionCopy,
+														children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+															className: ModelSelect_module_css_default.modelName,
+															children: model.name
+														})
+													}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: ModelSelect_module_css_default.check,
+														children: pending?.provider === group.id && pending.model === model.id ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.StateDot, { state: "ongoing" }) : selected ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCheckOutlineRegular, {}) : null
+													})]
+												}, model.id);
+											})
+										}, group.id);
+									})
+								}),
+								state.status === "ready" && filteredGroups.length === 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 									className: ModelSelect_module_css_default.empty,
-									children: t("empty.efforts")
-								}) : effortChoices.map((level) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
-									ref: itemRef(),
+									role: "status",
+									children: t(choices.length === 0 ? "empty.models" : "search.empty")
+								})
+							] }),
+							pane === "effort" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [state.error !== null && lastActionRef.current === "load" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: ModelSelect_module_css_default.error,
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("error.action", { message: state.error }) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 									type: "button",
-									role: "menuitemradio",
-									"aria-checked": effectiveEffort === level.effort,
-									className: clsx(ModelSelect_module_css_default.option, effectiveEffort === level.effort && ModelSelect_module_css_default.selected),
-									disabled: busy,
-									onClick: () => {
-										chooseEffort(level.effort);
-									},
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										className: ModelSelect_module_css_default.optionCopy,
-										children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-											className: ModelSelect_module_css_default.modelName,
-											children: level.label
-										})
-									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-										className: ModelSelect_module_css_default.check,
-										children: effectiveEffort === level.effort ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCheckOutline16, {}) : null
-									})]
-								}, level.key))] })
-							]
-						})]
+									className: ModelSelect_module_css_default.retry,
+									onClick: reload,
+									children: t("action.reload")
+								})]
+							}), effortChoices.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: ModelSelect_module_css_default.empty,
+								children: t("empty.efforts")
+							}) : effortChoices.map((level) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+								ref: itemRef(),
+								type: "button",
+								role: "menuitemradio",
+								"aria-checked": effectiveEffort === level.effort,
+								className: clsx(ModelSelect_module_css_default.option, effectiveEffort === level.effort && ModelSelect_module_css_default.selected),
+								disabled: busy,
+								onClick: () => {
+									chooseEffort(level.effort);
+								},
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: ModelSelect_module_css_default.optionCopy,
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: ModelSelect_module_css_default.modelName,
+										children: level.label
+									})
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: ModelSelect_module_css_default.check,
+									children: pending !== null && pending.provider === state.current?.provider && pending.model === state.current.model && pending.reasoningEffort === level.effort ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.StateDot, { state: "ongoing" }) : effectiveEffort === level.effort ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconCheckOutlineRegular, {}) : null
+								})]
+							}, level.key))] })
+						]
 					}), document.body),
 					toast !== null && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Toast, {
 						text: toast.text,
-						icon: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconWarningOutline16, {}),
+						icon: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconWarningOutlineRegular, {}),
 						anchor: rootRef.current?.closest("[data-composer-card]") ?? null,
 						onDone: () => {
 							setToast(null);
@@ -859,38 +1718,36 @@ window.__ModuleLoader__.load({
 		*/
 		/** Simplified Chinese dictionary (the key-set source of truth). */
 		const zh = {
+			"provider.account": "DeepSeek 账号",
 			"command.label": "模型",
 			"command.description": "选择本会话使用的模型",
 			"option.loadError": "目录加载失败：{message}",
-			"option.deepseekV4Flash.description": "快速、高效且经济；适合目标明确、常规或并行任务。",
-			"option.deepseekV4Pro.description": "更强的自主编码、知识与复杂推理能力；适合复杂或质量优先的任务，但成本更高。",
-			"trigger.fallback": "选择模型",
+			"trigger.fallback": "请选择模型",
 			"trigger.loading": "正在加载模型…",
-			"trigger.selectAria": "选择模型",
+			"trigger.selectAria": "请选择模型",
 			"trigger.aria": "选择模型，当前 {model}",
 			"trigger.ariaEffort": "选择模型，当前 {model}，推理等级 {effort}",
 			"menu.aria": "模型与推理等级",
 			"menu.model": "模型",
 			"menu.effort": "推理等级",
-			"search.placeholder": "搜索模型…",
-			"search.aria": "筛选模型",
-			"search.empty": "没有匹配的模型。",
 			"effort.providerDefault": "Default",
 			"status.loading": "正在刷新模型列表…",
 			"error.action": "模型操作失败：{message}",
+			"error.sessionInUse": "当前会话已被占用，可能是其他正在运行的 DSH 导致的（如其他 dsh web、桌面端），请退出其他正在运行的 DSH 后重试。",
 			"action.reload": "重新加载",
 			"warning.groupLoad": "{name} 加载失败：{message}",
+			"search.placeholder": "搜索模型…",
+			"search.clear": "清除搜索",
+			"search.empty": "没有匹配的模型。",
 			"empty.models": "没有可用的模型。",
-			"blocked.composer": "当前模型不可用，请先选择模型",
 			"empty.efforts": "当前模型未提供推理等级。"
 		};
 		/** English dictionary, checked complete against the zh key set. */
 		const en = {
+			"provider.account": "DeepSeek Account",
 			"command.label": "Model",
 			"command.description": "Select the model for this conversation",
 			"option.loadError": "Catalog failed to load: {message}",
-			"option.deepseekV4Flash.description": "Fast, efficient, and economical; suited to focused, routine, or parallel tasks.",
-			"option.deepseekV4Pro.description": "Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost.",
 			"trigger.fallback": "Select model",
 			"trigger.loading": "Loading models…",
 			"trigger.selectAria": "Select model",
@@ -899,16 +1756,16 @@ window.__ModuleLoader__.load({
 			"menu.aria": "Model and reasoning effort",
 			"menu.model": "Model",
 			"menu.effort": "Effort",
-			"search.placeholder": "Search models…",
-			"search.aria": "Filter models",
-			"search.empty": "No models match your search.",
 			"effort.providerDefault": "Default",
 			"status.loading": "Refreshing model list…",
 			"error.action": "Model operation failed: {message}",
+			"error.sessionInUse": "This session is already in use, possibly by another running DSH instance (such as dsh web or the desktop app). Quit other running DSH instances and try again.",
 			"action.reload": "Reload",
 			"warning.groupLoad": "{name} failed to load: {message}",
+			"search.placeholder": "Search models…",
+			"search.clear": "Clear search",
+			"search.empty": "No matching models.",
 			"empty.models": "No models available.",
-			"blocked.composer": "This model is unavailable — select one to continue",
 			"empty.efforts": "This model provides no reasoning effort levels."
 		};
 		//#endregion
@@ -917,29 +1774,24 @@ window.__ModuleLoader__.load({
 		function rowId(providerId, modelId) {
 			return `${providerId}/${modelId}`;
 		}
-		const BUILTIN_DESCRIPTION_KEYS = {
-			"deepseek-official/deepseek-v4-flash": "option.deepseekV4Flash.description",
-			"deepseek-official/deepseek-v4-pro": "option.deepseekV4Pro.description"
-		};
-		function descriptionOf(providerId, model, t) {
-			const key = BUILTIN_DESCRIPTION_KEYS[rowId(providerId, model.id)];
-			return key !== void 0 && model.description === en[key] ? t(key) : model.description;
-		}
 		/** Flatten the directory into popup rows; failure rows are listed for visibility but never selectable. */
 		function optionsOf(directory, t) {
 			const rows = [];
-			for (const group of directory.groups) for (const model of group.models) {
-				const description = descriptionOf(group.id, model, t);
-				rows.push({
+			for (const group of orderModelProviders(directory.groups)) {
+				const name = group.id === "deepseek-account" ? t("provider.account") : group.name;
+				for (const model of group.models) rows.push({
 					id: rowId(group.id, model.id),
 					label: model.name,
-					detail: description !== void 0 ? `${group.name} · ${description}` : group.name,
+					group: {
+						name: group.id,
+						label: name
+					},
 					...directory.current !== null && directory.current.provider === group.id && directory.current.model === model.id ? { active: true } : {}
 				});
 			}
 			for (const failure of directory.failures) rows.push({
 				id: `failure/${failure.id}`,
-				label: failure.name,
+				label: failure.id === "deepseek-account" ? t("provider.account") : failure.name,
 				detail: t("option.loadError", { message: failure.message })
 			});
 			return rows;
@@ -985,7 +1837,7 @@ window.__ModuleLoader__.load({
 				en
 			}), "ui-model-selection: dictionaries");
 			const t = ctx.locale.bind(NS);
-			ctx.plugin(ModelDirectoryResolver, { blockReason: () => t("blocked.composer") });
+			ctx.plugin(ModelDirectoryResolver);
 			ctx.inject(["commandUi", "modelDirectories"], (scope) => {
 				const command = scope.get("commandUi");
 				const models = scope.modelDirectories;
@@ -994,10 +1846,16 @@ window.__ModuleLoader__.load({
 					name: "model",
 					label: () => t("command.label"),
 					description: () => t("command.description"),
-					icon: _deepseek_ai_dsh_client_ui_primitives.IconDataOutline16,
+					icon: _deepseek_ai_dsh_client_ui_primitives.IconDataOutlineRegular,
 					available: (session) => sessions.subagentAddress(session.sessionId) === void 0,
 					ui: {
 						kind: "popupSelect",
+						searchMode: "fuzzy-label",
+						searchLabels: () => ({
+							placeholder: t("search.placeholder"),
+							empty: t("empty.models"),
+							noResults: t("search.empty")
+						}),
 						options: async (session) => {
 							if (sessions.subagentAddress(session.sessionId) !== void 0) throw new Error("model selection is unavailable for addressed subagent sessions");
 							return optionsOf(await models.directoryFor(session.sessionId).load(), t);
@@ -1007,7 +1865,11 @@ window.__ModuleLoader__.load({
 							const directory = models.directoryFor(session.sessionId);
 							const selection = selectionOf(directory.store.getSnapshot(), option.id);
 							if (selection === void 0) throw new Error("this provider's catalog failed to load — pick a model from a loaded group");
-							await directory.select(selection);
+							const result = await directory.select(selection);
+							if (!result.ok) {
+								if (result.error.code === "session/writer-held") throw new Error(t("error.sessionInUse"));
+								throw result.error;
+							}
 						}
 					}
 				}), "ui-model-selection: /model contribution");
@@ -1027,7 +1889,7 @@ window.__ModuleLoader__.load({
 							load: () => {
 								if (available) directory.load().catch(() => {});
 							},
-							select: (selection) => available ? directory.select(selection).then(() => true, () => false) : Promise.resolve(false)
+							select: (selection) => available ? directory.select(selection) : Promise.resolve(void 0)
 						};
 					}
 				}, ModelSelect));

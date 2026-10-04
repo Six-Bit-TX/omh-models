@@ -6,6 +6,6 @@
   "license": "MIT",
   "main": "index.js",
   "peerDependencies": {
-    "@deepseek-ai/dsh-typert-registry": "0.1.6-alpha.1"
+    "@deepseek-ai/dsh-typert-registry": "0.2.1-alpha.1"
   }
 }
