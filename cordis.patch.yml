@@ -1,0 +1,38 @@
+# Apply after the 0.1.6-alpha.1 Web bundle.
+- id: ui-model-selection
+  disabled: true
+- id: ui-settings-plugins
+  disabled: true
+- id: permission
+  disabled: true
+- id: sandbox
+  disabled: true
+- insert:
+    - id: omh-models-rpc-schemas
+      name: ./plugins/rpc-schemas/index.js
+    - id: omh-models-ui-model-selection
+      name: ./plugins/ui-model-selection/lib/index.js
+    - id: omh-models-ui-settings-plugins
+      name: ./plugins/ui-settings-plugins/lib/index.js
+    - id: omh-models-permission
+      name: ./plugins/permission-presets/lib/index.js
+      config:
+        presets:
+          read-only:
+            sandbox: read-only
+            approval: ask
+          workspace-write:
+            sandbox: workspace-write
+            approval: ask
+          danger-full-access:
+            sandbox: danger-full-access
+            approval: never
+    - id: omh-models-sandbox
+      name: ./plugins/sandbox-local/lib/index.js
+      config:
+        gpuDevices: true
+    - id: omh-models-model-sync
+      name: ./plugins/model-sync/index.js
+      config:
+        bridge: http://127.0.0.1:10100/v1/models
+        routes: [opencodex, cursor]

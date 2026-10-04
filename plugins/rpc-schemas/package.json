@@ -1,0 +1,11 @@
+{
+  "name": "@omh/models-rpc-schemas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "main": "index.js",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-typert-registry": "0.1.6-alpha.1"
+  }
+}

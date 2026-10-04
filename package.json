@@ -1,0 +1,52 @@
+{
+  "name": "@omh/models",
+  "version": "0.1.0",
+  "description": "Model discovery, searchable selection, persistent permission defaults, and confined GPU access",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": "0.1.6-alpha.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node scripts/check.mjs && node --test scripts/install.test.mjs plugins/model-sync/tests/*.test.js",
+    "install:profile": "node scripts/install.mjs",
+    "check:bundle": "node scripts/check.mjs",
+    "test:installer": "node --test scripts/install.test.mjs",
+    "build:client": "node scripts/build-client.mjs"
+  },
+  "files": [
+    "plugins",
+    "companions",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md",
+    "UPSTREAM.json",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Six-Bit-TX/omh-models.git"
+  },
+  "homepage": "https://github.com/Six-Bit-TX/omh-models",
+  "bugs": {
+    "url": "https://github.com/Six-Bit-TX/omh-models/issues"
+  },
+  "omh": {
+    "features": [
+      "OMH-40",
+      "OMH-41",
+      "OMH-42",
+      "OMH-43",
+      "OMH-44"
+    ]
+  }
+}
